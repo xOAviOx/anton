@@ -2,7 +2,7 @@
 
 Drive [Claude Code](https://claude.com/claude-code) from Discord. Message the bot,
 it runs the `claude` CLI inside one of your local project directories and streams
-progress — tool calls, file edits, and the final answer — back into the channel.
+progress tool calls, file edits, and the final answer back into the channel.
 
 ## Features
 
