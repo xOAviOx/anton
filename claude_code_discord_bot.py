@@ -122,3 +122,27 @@ ALLOWED_CHANNEL_IDS = {
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
+# ---------------------------------------------------------------------------
+# Per-channel state
+# ---------------------------------------------------------------------------
+@dataclass
+class ChannelState:
+    project: Optional[str] = None
+    session_id: Optional[str] = None
+    model: Optional[str] = CLAUDE_MODEL or None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    proc: Optional[asyncio.subprocess.Process] = None  # active process, if any
+    # Usage tracking (cumulative for this channel, since the bot started)
+    runs: int = 0
+    total_cost: float = 0.0
+    last_rate_limit: Optional[dict] = None  # most recent rate_limit_event payload
+
+STATE: dict[int, ChannelState] = {}
+
+def state_for(channel_id: int) -> ChannelState:
+    st = STATE.get(channel_id)
+    if st is None:
+        st = ChannelState(project=DEFAULT_PROJECT)
+        STATE[channel_id] = st
+    return st
+
