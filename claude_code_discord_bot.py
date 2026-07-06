@@ -358,3 +358,151 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str):
         if tick_task is not None and not tick_task.done():
             tick_task.cancel()
 
+# ---------------------------------------------------------------------------
+# Discord client + command handling
+# ---------------------------------------------------------------------------
+intents = discord.Intents.default()
+intents.message_content = True
+client = discord.Client(intents=intents)
+
+HELP = (
+    "**Claude Code control**\n"
+    f"`{PREFIX}cc <prompt>` — run Claude Code in the current project (continues the session)\n"
+    f"`{PREFIX}new` — start a fresh session\n"
+    f"`{PREFIX}project [name]` — show or switch project\n"
+    f"`{PREFIX}projects` — list projects\n"
+    f"`{PREFIX}model [name]` — show or switch model (sonnet / opus / haiku / default)\n"
+    f"`{PREFIX}usage` — runs, cost, and rate-limit utilization\n"
+    f"`{PREFIX}status` — current project / session / activity\n"
+    f"`{PREFIX}cancel` — kill the running task\n"
+)
+
+
+def authorized(message: discord.Message) -> bool:
+    if message.author.id not in ALLOWED_USER_IDS:
+        return False
+    if ALLOWED_CHANNEL_IDS and message.channel.id not in ALLOWED_CHANNEL_IDS:
+        return False
+    return True
+
+
+@client.event
+async def on_ready():
+    print(f"Logged in as {client.user} (id {client.user.id})")
+    print(f"Allowed users: {ALLOWED_USER_IDS or 'NONE — nobody can use the bot!'}")
+    print(f"Projects: {list(PROJECTS) or 'NONE — set PROJECTS'}")
+
+
+@client.event
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.content.startswith(PREFIX):
+        return
+    if not authorized(message):
+        return  # silently ignore non-allowlisted users/channels
+
+    parts = message.content[len(PREFIX):].split(maxsplit=1)
+    cmd = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    st = state_for(message.channel.id)
+
+    if cmd == "help":
+        await message.reply(HELP)
+
+    elif cmd == "projects":
+        if not PROJECTS:
+            await message.reply("No projects configured. Set PROJECTS in env or the script.")
+        else:
+            lines = "\n".join(f"• `{n}` → {p}" for n, p in PROJECTS.items())
+            await message.reply(f"**Projects:**\n{lines}")
+
+    elif cmd == "project":
+        if not arg:
+            await message.reply(f"Current project: **{st.project or 'none'}**")
+        elif arg not in PROJECTS:
+            await message.reply(f"Unknown project `{arg}`. Try `{PREFIX}projects`.")
+        else:
+            st.project = arg
+            st.session_id = None  # sessions are scoped to a directory
+            await message.reply(f"Switched to **{arg}** (fresh session).")
+
+    elif cmd == "model":
+        if not arg:
+            await message.reply(
+                f"Current model: **{st.model or 'default'}**\n"
+                f"Switch with `{PREFIX}model <sonnet|opus|haiku|default|full-model-string>`."
+            )
+        elif arg.lower() in ("default", "reset", "none"):
+            st.model = None
+            await message.reply("Model reset to **default**.")
+        else:
+            st.model = arg.lower() if arg.lower() in KNOWN_MODELS else arg
+            await message.reply(f"Model set to **{st.model}** for this channel.")
+
+    elif cmd == "usage":
+        lines = [
+            f"**Usage — {st.project or 'none'}**",
+            f"Runs this session: **{st.runs}**",
+            f"Cost this session: **${st.total_cost:.4f}**",
+            f"Model: **{st.model or 'default'}**",
+        ]
+        rl = st.last_rate_limit
+        if rl:
+            util = rl.get("utilization")
+            rl_type = rl.get("rateLimitType", "limit")
+            if util is not None:
+                lines.append(f"Rate limit ({rl_type}): **{float(util) * 100:.0f}%** used")
+            resets = rl.get("resetsAt")
+            if resets:
+                lines.append(f"Resets: <t:{int(resets)}:R>")
+        else:
+            lines.append("_Rate-limit info appears after your first `!cc` run._")
+        await message.reply("\n".join(lines))
+
+    elif cmd == "new":
+        st.session_id = None
+        await message.reply(f"Started a fresh session for **{st.project or 'none'}**.")
+
+    elif cmd == "status":
+        running = "yes" if st.proc and st.proc.returncode is None else "no"
+        await message.reply(
+            f"Project: **{st.project or 'none'}**\n"
+            f"Session: `{st.session_id or 'none'}`\n"
+            f"Running: {running}"
+        )
+
+    elif cmd == "cancel":
+        if st.proc and st.proc.returncode is None:
+            await kill(st.proc)
+            await message.reply("🛑 Killed the running task.")
+        else:
+            await message.reply("Nothing is running.")
+
+    elif cmd == "cc":
+        if not arg:
+            await message.reply(f"Usage: `{PREFIX}cc <prompt>`")
+            return
+        if not st.project or st.project not in PROJECTS:
+            await message.reply(f"No valid project set. Use `{PREFIX}project <name>`.")
+            return
+        if st.lock.locked():
+            await message.reply(
+                f"A task is already running in this channel. `{PREFIX}cancel` to stop it, "
+                "or use another channel."
+            )
+            return
+        async with st.lock:
+            await run_claude(message, st, arg)
+
+
+def main():
+    if not TOKEN:
+        sys.exit("DISCORD_TOKEN is not set.")
+    if not ALLOWED_USER_IDS:
+        sys.exit("ALLOWED_USER_IDS is empty — refusing to start an open bot.")
+    if not PROJECTS:
+        print("WARNING: no PROJECTS configured; !cc won't work until you add one.")
+    client.run(TOKEN)
+
+
+if __name__ == "__main__":
+    main()
