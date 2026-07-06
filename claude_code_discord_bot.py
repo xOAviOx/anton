@@ -226,3 +226,135 @@ async def kill(proc: Optional[asyncio.subprocess.Process]):
             except ProcessLookupError:
                 pass
 
+# ---------------------------------------------------------------------------
+# Core: run Claude Code and stream progress into a Discord message
+# ---------------------------------------------------------------------------
+async def run_claude(message: discord.Message, st: ChannelState, prompt: str):
+    project_path = PROJECTS[st.project]
+    cmd = build_command(prompt, st.session_id, st.model)
+
+    status = await message.reply(f"🧠 Working in **{st.project}**…")
+    activity: list[str] = []
+    final_text = ""
+    new_session = st.session_id
+    cost = None
+    is_error = False
+    last_edit = 0.0
+
+    async def render():
+        nonlocal last_edit
+        tail = activity[-12:]
+        body = f"🧠 **{st.project}** · running…\n" + ("\n".join(tail) if tail else "_thinking…_")
+        try:
+            await status.edit(content=body[:MAX_MSG])
+        except discord.HTTPException:
+            pass
+        last_edit = time.monotonic()
+
+    # Background ticker so the status message updates even during quiet thinking phases.
+    async def ticker():
+        while True:
+            await asyncio.sleep(STATUS_EDIT_INTERVAL)
+            if time.monotonic() - last_edit > STATUS_EDIT_INTERVAL:
+                await render()
+
+    tick_task: Optional[asyncio.Task] = None
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=project_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        st.proc = proc
+
+        stderr_task = asyncio.create_task(proc.stderr.read())
+        tick_task = asyncio.create_task(ticker())
+
+        async def read_stream():
+            nonlocal final_text, new_session, cost, is_error
+            if proc.stdout is None:
+                return
+            async for raw in proc.stdout:
+                line = raw.decode(errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                etype = evt.get("type")
+
+                if etype == "system":
+                    if evt.get("subtype") == "init":
+                        new_session = evt.get("session_id", new_session)
+                    elif evt.get("subtype") == "api_retry":
+                        activity.append(f"⏳ retrying ({evt.get('error', 'error')})…")
+
+                elif etype == "assistant":
+                    for block in evt.get("message", {}).get("content", []):
+                        if block.get("type") == "tool_use":
+                            activity.append(summarize_tool(block.get("name", "?"),
+                                                           block.get("input", {})))
+
+                elif etype == "result":
+                    final_text = evt.get("result") or final_text
+                    new_session = evt.get("session_id", new_session)
+                    cost = evt.get("total_cost_usd", cost)
+                    is_error = bool(evt.get("is_error"))
+
+                elif etype == "rate_limit_event":
+                    info = evt.get("rate_limit_info")
+                    if info:
+                        st.last_rate_limit = info
+
+                if time.monotonic() - last_edit > STATUS_EDIT_INTERVAL:
+                    await render()
+
+        await asyncio.wait_for(read_stream(), timeout=RUN_TIMEOUT)
+        await proc.wait()
+
+        tick_task.cancel()
+        stderr_bytes = await stderr_task
+        stderr = stderr_bytes.decode(errors="replace")
+
+        st.session_id = new_session  # persist for next !cc
+        st.runs += 1
+        if cost is not None:
+            st.total_cost += cost
+
+        # Final status line
+        footer = f"✅ done · **{st.project}**"
+        if cost is not None:
+            footer += f" · ${cost:.4f}"
+        if is_error or proc.returncode not in (0, None):
+            footer = f"⚠️ finished with issues · **{st.project}** (exit {proc.returncode})"
+        await status.edit(content=footer[:MAX_MSG])
+
+        pieces = chunk(final_text) or ["_(no textual output)_"]
+        for p in pieces:
+            await message.channel.send(p)
+        if (is_error or proc.returncode not in (0, None)) and stderr.strip():
+            for p in chunk("stderr:\n" + stderr):
+                await message.channel.send(f"```\n{p}\n```")
+
+    except asyncio.TimeoutError:
+        await kill(st.proc)
+        await status.edit(content=f"⏱️ timed out after {RUN_TIMEOUT}s · **{st.project}**")
+    except FileNotFoundError:
+        await status.edit(
+            content="❌ `claude` not found. Install Claude Code and make sure it's on PATH "
+                    "(or set CLAUDE_BIN to the full path)."
+        )
+    except asyncio.CancelledError:
+        await kill(st.proc)
+        await status.edit(content=f"🛑 cancelled · **{st.project}**")
+        raise
+    except Exception as e:  # noqa: BLE001 - surface anything else to the user
+        await kill(st.proc)
+        await status.edit(content=f"❌ error: {type(e).__name__}: {str(e)[:400]}")
+    finally:
+        st.proc = None
+        if tick_task is not None and not tick_task.done():
+            tick_task.cancel()
+
