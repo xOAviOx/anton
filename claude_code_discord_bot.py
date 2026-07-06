@@ -146,3 +146,83 @@ def state_for(channel_id: int) -> ChannelState:
         STATE[channel_id] = st
     return st
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def build_command(prompt: str, session_id: Optional[str],
+                  model: Optional[str] = None) -> list[str]:
+    """Resolve the claude binary and assemble the headless invocation."""
+    resolved = shutil.which(CLAUDE_BIN) or CLAUDE_BIN
+    args = [
+        resolved,
+        "-p", prompt,
+        "--output-format", "stream-json",
+        "--verbose",
+        "--permission-mode", PERMISSION_MODE,
+        "--allowedTools", ALLOWED_TOOLS,
+    ]
+    if model:
+        args += ["--model", model]
+    if session_id:
+        args += ["--resume", session_id]
+
+    # On Windows, npm installs `claude.cmd`, which must run via cmd.exe.
+    if os.name == "nt" and resolved.lower().endswith((".cmd", ".bat")):
+        args = ["cmd", "/c"] + args
+    return args
+
+
+def summarize_tool(name: str, inp: dict) -> str:
+    """One-line, human-readable summary of a tool_use block."""
+    def short(s, n=90):
+        s = " ".join(str(s).split())
+        return s if len(s) <= n else s[: n - 1] + "…"
+
+    icons = {"Bash": "🖥️", "Read": "📖", "Edit": "✏️", "Write": "📝",
+             "Glob": "🔎", "Grep": "🔎", "TodoWrite": "🗒️", "WebFetch": "🌐",
+             "WebSearch": "🌐", "Task": "🤖"}
+    icon = icons.get(name, "🔧")
+    if name == "Bash":
+        return f"{icon} `{short(inp.get('command', ''))}`"
+    if name in ("Read", "Edit", "Write"):
+        return f"{icon} {name}: {short(inp.get('file_path', ''))}"
+    if name in ("Glob", "Grep"):
+        return f"{icon} {name}: {short(inp.get('pattern', ''))}"
+    if name == "TodoWrite":
+        return f"{icon} updating todo list"
+    if name == "Task":
+        return f"{icon} sub-agent: {short(inp.get('description', ''))}"
+    return f"{icon} {name}"
+
+
+def chunk(text: str, size: int = MAX_MSG) -> list[str]:
+    """Split text into Discord-sized pieces, preferring newline boundaries."""
+    text = text.strip()
+    if not text:
+        return []
+    out, buf = [], ""
+    for line in text.split("\n"):
+        while len(line) > size:  # a single very long line
+            out.append(line[:size])
+            line = line[size:]
+        if len(buf) + len(line) + 1 > size:
+            out.append(buf)
+            buf = line
+        else:
+            buf = f"{buf}\n{line}" if buf else line
+    if buf:
+        out.append(buf)
+    return out
+
+
+async def kill(proc: Optional[asyncio.subprocess.Process]):
+    if proc and proc.returncode is None:
+        try:
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+
