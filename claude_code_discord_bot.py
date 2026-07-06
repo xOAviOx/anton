@@ -82,3 +82,43 @@ except ImportError:
 
 import discord
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+PREFIX = "!"
+CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")
+
+# Permission posture for headless runs. acceptEdits auto-approves file writes and
+# common fs commands; listing tools in ALLOWED_TOOLS auto-approves them too.
+PERMISSION_MODE = os.getenv("PERMISSION_MODE", "acceptEdits")
+ALLOWED_TOOLS = os.getenv("ALLOWED_TOOLS", "Read,Edit,Write,Bash,Glob,Grep,TodoWrite")
+
+# Default model for new channels. Empty string = Claude Code's own default.
+# Accepts aliases like "sonnet", "opus", "haiku" or a full model string.
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "")
+KNOWN_MODELS = ("sonnet", "opus", "haiku")  # convenience aliases for !model
+
+RUN_TIMEOUT = int(os.getenv("RUN_TIMEOUT", "1800"))  # seconds; hard cap per run
+STATUS_EDIT_INTERVAL = 1.3  # seconds between live status edits (Discord rate limits)
+MAX_MSG = 1900              # Discord hard limit is 2000; leave headroom
+
+# Projects: env JSON wins, else edit this dict directly.
+_PROJECTS_ENV = os.getenv("PROJECTS")
+if _PROJECTS_ENV:
+    PROJECTS = json.loads(_PROJECTS_ENV)
+else:
+    PROJECTS = {
+        # "maestro": "/home/avi/projects/maestro",
+        # "vitals":  "/home/avi/projects/vitals",
+    }
+DEFAULT_PROJECT = os.getenv("DEFAULT_PROJECT") or (next(iter(PROJECTS), None))
+
+ALLOWED_USER_IDS = {
+    int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x
+}
+ALLOWED_CHANNEL_IDS = {
+    int(x) for x in os.getenv("ALLOWED_CHANNEL_IDS", "").replace(" ", "").split(",") if x
+}
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+
