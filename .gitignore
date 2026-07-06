@@ -1,0 +1,19 @@
+# Secrets — never commit real tokens
+.env
+.env.local
+*.env
+!discord_bot.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
