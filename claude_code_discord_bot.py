@@ -17,6 +17,9 @@ Commands (default prefix "!"):
   !projects         List configured projects.
   !diff             Show what the current session changed (stat + full patch).
   !revert / !undo   Throw away the last run's changes (asks to confirm first).
+  !commit [msg]     Stage all changes and commit; Claude writes the message if
+                    you don't supply one.
+  !pr               Push the current branch and open a GitHub PR (needs `gh`).
   !status           Show current project + session + whether a run is active.
   !cancel           Kill the currently running Claude Code process.
   !help             Show this help.
@@ -296,6 +299,41 @@ def build_command(prompt: str, session_id: Optional[str],
     if os.name == "nt" and resolved.lower().endswith((".cmd", ".bat")):
         args = ["cmd", "/c"] + args
     return args
+
+
+async def claude_text(prompt: str, cwd: str, *, model: Optional[str] = None,
+                      timeout: int = 120) -> Optional[str]:
+    """One-off, tool-free, non-streaming `claude -p` for short helper prompts
+    (e.g. writing a commit message). Returns the trimmed text, or None on any
+    failure. Deliberately NOT gated by RUN_SEMAPHORE — it's short-lived and
+    shouldn't queue behind long interactive runs. Fresh session each time (no
+    --resume) so it can't pollute or depend on a channel's conversation.
+    """
+    resolved = shutil.which(CLAUDE_BIN) or CLAUDE_BIN
+    args = [
+        resolved,
+        "-p", prompt,
+        "--output-format", "text",
+        "--permission-mode", "plan",  # read-only: it must not touch the tree
+        "--allowedTools", "",         # no tools at all
+    ]
+    if model:
+        args += ["--model", model]
+    if os.name == "nt" and resolved.lower().endswith((".cmd", ".bat")):
+        args = ["cmd", "/c"] + args
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (asyncio.TimeoutError, FileNotFoundError, OSError):
+        return None
+    if proc.returncode not in (0, None):
+        return None
+    text = out.decode(errors="replace").strip()
+    return text or None
 
 
 def summarize_tool(name: str, inp: dict) -> str:
@@ -729,6 +767,8 @@ HELP = (
     "**Git safety net**\n"
     f"`{PREFIX}diff` — show what the current session changed (stat + full patch)\n"
     f"`{PREFIX}revert` — throw away the last run's changes (asks to confirm)\n"
+    f"`{PREFIX}commit [msg]` — stage all & commit (Claude writes the message if omitted)\n"
+    f"`{PREFIX}pr` — push the current branch and open a GitHub PR (needs `gh`)\n"
     "Set `AUTO_BRANCH=1` to isolate each session's edits on an `anton/…` branch.\n"
     "\n"
     "**Reactions on a run's status message**\n"
@@ -1042,6 +1082,109 @@ async def on_message(message: discord.Message):
             await warn.add_reaction("🛑")
         except discord.HTTPException:
             pass
+
+    elif cmd == "commit":
+        if not st.project or st.project not in PROJECTS:
+            await message.reply(f"No valid project set. Use `{PREFIX}project <name>`.")
+            return
+        if st.proc and st.proc.returncode is None:
+            await message.reply(f"A run is active — `{PREFIX}cancel` it before committing.")
+            return
+        project_path = PROJECTS[st.project]
+        if not await _is_git_repo(project_path):
+            await message.reply(f"**{st.project}** isn't a git repository — nothing to commit.")
+            return
+        # Stage everything, then check there's actually something to commit.
+        await _git(project_path, "add", "-A")
+        code, staged, _ = await _git(project_path, "diff", "--cached", "--stat")
+        if not staged:
+            await message.reply(f"Nothing staged to commit in **{st.project}**.")
+            return
+
+        notice = await message.reply("✍️ Writing a commit message…")
+        # A user-supplied `!commit <msg>` wins; otherwise ask Claude for one.
+        subject = arg.strip()
+        if not subject:
+            _, diff, _ = await _git(project_path, "diff", "--cached")
+            gen = await claude_text(
+                "Write a Conventional Commits message (a concise `type(scope): summary` "
+                "subject under 72 chars, optionally a short body) for this staged diff. "
+                "Output ONLY the commit message, no preamble, no backticks:\n\n"
+                + diff[:12000],
+                cwd=project_path, model=st.model,
+            )
+            subject = (gen or "").strip()
+        if not subject:
+            subject = "chore: update via anton"  # graceful fallback
+            fell_back = True
+        else:
+            fell_back = False
+
+        code, out, err = await _git(project_path, "commit", "-m", subject)
+        if code != 0:
+            await notice.edit(content=f"❌ Commit failed:\n```\n{(err or out)[:1500]}\n```")
+            return
+        _, short_hash, _ = await _git(project_path, "rev-parse", "--short", "HEAD")
+        first_line = subject.splitlines()[0]
+        tag = " _(default message — Claude was unavailable)_" if fell_back else ""
+        await notice.edit(
+            content=f"✅ Committed `{short_hash}` on **{st.project}**:\n> {first_line}{tag}"
+        )
+
+    elif cmd == "pr":
+        if not st.project or st.project not in PROJECTS:
+            await message.reply(f"No valid project set. Use `{PREFIX}project <name>`.")
+            return
+        project_path = PROJECTS[st.project]
+        if not await _is_git_repo(project_path):
+            await message.reply(f"**{st.project}** isn't a git repository.")
+            return
+        if shutil.which("gh") is None:
+            await message.reply(
+                "`gh` (GitHub CLI) isn't installed on the host, so I can't open a PR. "
+                "Install it and run `gh auth login`, then try again."
+            )
+            return
+        # Refuse if there are uncommitted changes — PR them intentionally.
+        _, dirty, _ = await _git(project_path, "status", "--porcelain")
+        if dirty:
+            await message.reply(
+                f"You have uncommitted changes — `{PREFIX}commit` them first, then `{PREFIX}pr`."
+            )
+            return
+        _, branch, _ = await _git(project_path, "rev-parse", "--abbrev-ref", "HEAD")
+        if branch in ("", "HEAD"):
+            await message.reply("Not on a branch (detached HEAD) — can't open a PR.")
+            return
+        if branch in ("main", "master"):
+            await message.reply(
+                f"You're on `{branch}` — open PRs from a feature branch "
+                f"(e.g. run with `AUTO_BRANCH=1`, or `git switch -c`)."
+            )
+            return
+
+        notice = await message.reply(f"🚀 Pushing `{branch}` and opening a PR…")
+        code, _, err = await _git(project_path, "push", "-u", "origin", branch)
+        if code != 0:
+            await notice.edit(content=f"❌ Push failed:\n```\n{err[:1500]}\n```")
+            return
+        # gh isn't git; run it directly (still async, still in the project dir).
+        proc = await asyncio.create_subprocess_exec(
+            "gh", "pr", "create", "--fill",
+            cwd=project_path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out_b, err_b = await proc.communicate()
+        out = out_b.decode(errors="replace").strip()
+        err = err_b.decode(errors="replace").strip()
+        if proc.returncode != 0:
+            # Most common cause: a PR already exists for this branch.
+            await notice.edit(
+                content=f"⚠️ Pushed `{branch}`, but `gh pr create` failed:\n"
+                        f"```\n{(err or out)[:1500]}\n```"
+            )
+            return
+        await notice.edit(content=f"✅ PR opened for **{st.project}**: {out or '(see GitHub)'}")
 
 
 def main():

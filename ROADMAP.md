@@ -117,7 +117,7 @@ safety layer. All of these shell out with `cwd=PROJECTS[st.project]`.
   before each run and store it on `ChannelState`), or restore a pre-run
   `git stash`. Confirm with a reaction before destroying work.
 
-### 2.4 `!commit` and `!pr` 🟡
+### 2.4 `!commit` and `!pr` 🟡 ✅ done
 
 - **What:** `!commit` commits changes with a Claude-generated message; `!pr` pushes
   the branch and opens a GitHub PR.
@@ -125,6 +125,17 @@ safety layer. All of these shell out with `cwd=PROJECTS[st.project]`.
   diff"` (non-streaming), then `git commit -am`. `!pr` — `git push -u origin
   <branch>` then `gh pr create --fill`. Requires `gh` authenticated on the host;
   document in README.
+
+> **Implementation notes (shipped):** the commit message comes from a new
+> `claude_text()` helper — a tool-free, read-only (`--permission-mode plan`),
+> non-streaming `claude -p` in a fresh session, run *outside* `RUN_SEMAPHORE`
+> since it's short-lived and shouldn't queue behind interactive runs. It stages
+> with `git add -A` (not `commit -am`, so new files are included) and falls back
+> to a generic message if Claude is unavailable rather than failing. `!commit`
+> also accepts an explicit `!commit <msg>` override. `!pr` degrades gracefully
+> when `gh` is missing/unauthenticated, refuses to run with a dirty tree or from
+> `main`/`master`, and surfaces `gh`'s own error (commonly "a PR already
+> exists") instead of masking it.
 
 ---
 

@@ -13,7 +13,7 @@ progress tool calls, file edits, and the final answer back into the channel.
 - Plan → approve → execute: `!plan` drafts a read-only plan and waits for a ✅
   reaction before touching your files
 - Git safety net: optional per-session auto-branching, `!diff` to review a run's
-  changes, and `!revert` to throw them away
+  changes, `!revert` to throw them away, and `!commit` / `!pr` to ship them
 - Multiple projects, switchable per channel
 - Session continuity so follow-up messages continue the same conversation
 - State (project, session, usage) survives bot restarts
@@ -117,9 +117,18 @@ project directory and no-op gracefully if it isn't a git repo.
 | --- | --- |
 | `!diff` | Show what the current session changed — `git diff --stat` inline plus the full patch as a `.diff` attachment |
 | `!revert` / `!undo` | Reset the project back to the checkpoint taken before the last run (`git reset --hard` + `git clean -fd`), after a ✅ confirmation |
+| `!commit [msg]` | Stage everything and commit. With no message, Claude writes a Conventional Commits message from the staged diff; pass your own to override |
+| `!pr` | Push the current branch to `origin` and open a GitHub PR with `gh pr create --fill` |
 
 Before every run the bot records the project's current `HEAD` as a checkpoint, so
 `!diff` and `!revert` work even without auto-branching.
+
+`!commit` refuses when nothing is staged and never runs mid-session; if Claude
+can't be reached to write a message it falls back to a generic one rather than
+failing. `!pr` needs the [GitHub CLI](https://cli.github.com/) (`gh`) installed
+and authenticated (`gh auth login`) on the host, refuses to run with uncommitted
+changes or from `main`/`master`, and surfaces `gh`'s error (e.g. "a PR already
+exists") if it can't create one.
 
 Set `AUTO_BRANCH=1` to go a step further: the first run of each session creates an
 `anton/<timestamp>-<uuid>` branch and switches to it, so that session's edits are
