@@ -19,6 +19,9 @@ progress tool calls, file edits, and the final answer back into the channel.
 - History & cost: every run is logged (`!history`, `!resume <id>`), spend is
   tracked (`!cost`), an optional `DAILY_BUDGET_USD` caps it, and long runs can
   `@`-mention you when they finish
+- Live permission prompts: `!strict on` makes Bash/Edit/Write/etc. wait for a
+  ✅/❌ Discord reaction before Claude Code is allowed to run them, instead of
+  auto-accepting
 - Multiple projects, switchable per channel
 - Session continuity so follow-up messages continue the same conversation
 - State (project, session, usage) survives bot restarts
@@ -186,6 +189,33 @@ it survives restarts (unlike reply-to-continue's in-memory map).
 Set `NOTIFY_AFTER_SECONDS` (default 120; 0 disables) so any run that takes at
 least that long `@`-mentions you in the channel when it finishes — fire a task
 from your phone, walk away, and get pinged when it's done.
+
+## Live permission prompts
+
+`!cc` normally runs with `PERMISSION_MODE` (default `acceptEdits`) plus
+`ALLOWED_TOOLS`, which auto-accepts file edits and the listed tools — fast, but
+no per-action oversight. `!strict on` swaps that out for true remote approval:
+Claude Code is launched with `--permission-mode default` and a much smaller
+allowed-tools list (`STRICT_ALLOWED_TOOLS`, default `Read,Glob,Grep,TodoWrite`
+— safe, read-only). Anything else it wants to do — Bash, Edit, Write,
+WebFetch, WebSearch, spawning a Task sub-agent — gets routed to
+`anton_mcp_approve.py`, a tiny stdio MCP server the bot spawns alongside
+`claude` for that run, wired in via `--permission-prompt-tool
+mcp__anton__approve`. It posts the exact command/file/URL to the channel and
+waits; react ✅ to allow it or ❌ to deny it. No reaction within
+`APPROVAL_TIMEOUT_SECONDS` (default 600 = 10 min) denies it automatically.
+
+`!strict` is per-channel and persists like `!model`. Plan mode (`!plan`) is
+unaffected — it's already read-only — and executing an *approved* plan still
+runs at full speed (`acceptEdits`), since you already reviewed the whole plan
+up front; strict mode is specifically for direct `!cc` runs where nobody's
+looked at what Claude's about to do yet.
+
+`anton_mcp_approve.py` must stay next to `claude_code_discord_bot.py` — the
+bot passes its own path to `claude` as the MCP server command. It needs no
+extra dependencies (stdlib only) and talks to the bot only through the same
+`anton.db` SQLite file (an `approvals` table), since it runs as `claude`'s own
+subprocess and has no Discord connection of its own.
 
 ## Security
 

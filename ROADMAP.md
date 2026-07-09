@@ -65,7 +65,7 @@ A Discord bridge is uniquely good at approval loops you can drive from your phon
   session** (`--resume new_session`) with `--permission-mode acceptEdits` and the
   original prompt to carry out the plan.
 
-### 1.3 Live permission prompts 🔴
+### 1.3 Live permission prompts 🔴 ✅ done
 
 - **What:** Instead of blanket `acceptEdits`, when Claude wants to run a `Bash`
   command (or edit outside the repo), the bot posts the exact command and waits for
@@ -75,6 +75,46 @@ A Discord bridge is uniquely good at approval loops you can drive from your phon
   requested tool + input to Discord, awaits a reaction, and returns allow/deny to
   Claude Code. Requires running an MCP server alongside the bot (stdio or HTTP).
 - **Note:** Most powerful feature; build it standalone after Phase 1.1–1.2.
+
+> **Implementation notes (shipped):** the `--permission-prompt-tool` /
+> `--mcp-config` protocol isn't documented in the public CLI reference (as of
+> Claude Code 2.1.205), so this was built by empirically verifying it — a
+> throwaway debug MCP server logged the real JSON-RPC traffic from a live
+> `claude -p` run. Confirmed facts, since they aren't written down elsewhere:
+> the tool is called with `arguments: {tool_name, input, tool_use_id}`; the
+> reply must be a single `{"type":"text","text":"<json>"}` content block
+> containing `{"behavior":"allow","updatedInput":{...}}` or
+> `{"behavior":"deny","message":"..."}`; `--mcp-config` accepts an inline JSON
+> string (no temp file needed) and its `env` block does reach the spawned
+> server process; omitting `--strict-mcp-config` merges our server with
+> whatever else the project already has configured rather than replacing it.
+> Denials surface to Claude as a normal (non-fatal) tool error and the run
+> finishes normally — confirmed with real allow, deny, and timeout runs
+> against a project directory, not just unit-level checks.
+>
+> **Architecture:** `!strict on` persists per-channel like `!model`. When set
+> (and the run isn't plan mode, and no caller already forced a
+> `permission_mode` — e.g. a plan-approval execute still runs at full
+> `acceptEdits`, since a human already reviewed the whole plan), `run_claude`
+> swaps in `permission_mode="default"` + `STRICT_ALLOWED_TOOLS` (default
+> `Read,Glob,Grep,TodoWrite`) and generates an inline `--mcp-config` pointing
+> at `anton_mcp_approve.py`, passing `ANTON_DB` / `ANTON_CHANNEL_ID` /
+> `ANTON_APPROVAL_TIMEOUT` via the config's `env`. That script is a genuinely
+> separate OS process (`claude` spawns it directly over stdio) with no
+> Discord connection of its own, so it can't post/react on its own — it just
+> inserts a row into a new `approvals` SQLite table and polls it. The bot's
+> `approval_watcher()` background task is the other half: it notices new
+> pending rows, posts them to the right channel with ✅/❌, and the
+> `on_reaction_add` handler writes the decision straight back to that row.
+> `approval_watcher()` also has to catch the one case reactions can't drive:
+> the helper's own timeout-deny, which needs polling to notice at all. A
+> run's `finally` block denies any of its still-pending approvals when it
+> ends for any other reason (killed, crashed, timed out), so a dead run can't
+> leave a ✅/❌ card stuck in Discord forever.
+> **Known limitation:** the helper script is single-threaded/blocking, so if
+> Claude fires two approval-needing tool calls before the first is answered,
+> the second just queues behind it — fine for one person driving one thing at
+> a time, not built for concurrency within a single run.
 
 ---
 
@@ -274,7 +314,7 @@ safety layer. All of these shell out with `cwd=PROJECTS[st.project]`.
 4. **Phase 2.4** (`!commit`, `!pr`). ✅ done
 5. **Phase 3** (attachments, reply-to-continue). ✅ done
 6. **Phase 4** (history, budgets, notifications). ✅ done
-7. **Phase 1.3** (live permission MCP) — powerful, standalone.
+7. **Phase 1.3** (live permission MCP) — powerful, standalone. ✅ done
 8. **Phase 5–6** (automation, multi-project) as needed.
 
 ## Cross-cutting

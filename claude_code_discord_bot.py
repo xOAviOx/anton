@@ -16,6 +16,8 @@ Commands (default prefix "!"):
   !project [name]   Show the current project, or switch to a configured one.
   !projects         List configured projects.
   !model [name]     Show or switch the model (sonnet / opus / haiku / default).
+  !strict [on|off]  Toggle live permission prompts: Bash/Edit/etc. wait for a
+                    ✅/❌ reaction instead of auto-accepting.
   !usage            Runs, cost, and rate-limit utilization for this channel.
   !history [n]      List recent runs in this channel (default 10).
   !resume <id>      Resume the session from a past run (see !history).
@@ -44,6 +46,10 @@ git branch so they're easy to review (!diff) or discard (!revert).
 Every run is logged for !history / !resume and cost tracking. Set
 DAILY_BUDGET_USD to cap daily spend and NOTIFY_AFTER_SECONDS to be @-mentioned
 when a long run finishes.
+
+`!strict on` swaps blanket auto-accept for live, per-action Discord approval:
+Bash/Edit/Write/WebFetch/WebSearch/Task each wait for a ✅/❌ reaction before
+Claude Code is allowed to proceed (Read/Glob/Grep/TodoWrite stay auto-allowed).
 
 Each Discord channel keeps its own project + session, so you can run several
 projects in parallel from different channels.
@@ -162,6 +168,20 @@ MAX_ATTACH_COUNT = int(os.getenv("MAX_ATTACH_COUNT", "10"))
 DAILY_BUDGET_USD = float(os.getenv("DAILY_BUDGET_USD", "0"))
 NOTIFY_AFTER_SECONDS = int(os.getenv("NOTIFY_AFTER_SECONDS", "120"))
 
+# Live permission prompts (Phase 1.3). Toggled per-channel with `!strict`. When on,
+# a run uses permission-mode "default" with this much smaller allowedTools list
+# instead of the usual acceptEdits + ALLOWED_TOOLS — so Bash/Edit/Write/etc. are no
+# longer blanket pre-approved. Anything not in this list is routed through
+# anton_mcp_approve.py (a tiny stdio MCP server spawned per run), which posts the
+# exact tool + input to Discord and waits for a ✅/❌ reaction before Claude Code is
+# allowed to proceed. APPROVAL_TIMEOUT_SECONDS is how long it waits before denying
+# by default if nobody reacts.
+STRICT_ALLOWED_TOOLS = os.getenv("STRICT_ALLOWED_TOOLS", "Read,Glob,Grep,TodoWrite")
+APPROVAL_TIMEOUT_SECONDS = int(os.getenv("APPROVAL_TIMEOUT_SECONDS", "600"))
+APPROVE_SERVER_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "anton_mcp_approve.py"
+)
+
 
 # Projects: env JSON wins, else edit this dict directly.
 _PROJECTS_ENV = os.getenv("PROJECTS")
@@ -209,6 +229,11 @@ def _db() -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE channel_state ADD COLUMN {col}")
         except sqlite3.OperationalError:
             pass  # duplicate column — already migrated
+    # Phase 1.3: per-channel toggle for live permission prompts (see !strict).
+    try:
+        conn.execute("ALTER TABLE channel_state ADD COLUMN strict_mode INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # duplicate column — already migrated
     # Phase 4: one row per run, for !history / !resume and daily-budget sums.
     conn.execute(
         """
@@ -226,6 +251,24 @@ def _db() -> sqlite3.Connection:
         )
         """
     )
+    # Phase 1.3: one row per live-permission-prompt request. Written by
+    # anton_mcp_approve.py (a separate process claude spawns per strict-mode run);
+    # read/updated here by approval_watcher() and the ✅/❌ reaction handler.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS approvals (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id    INTEGER NOT NULL,
+            tool_name     TEXT,
+            input_json    TEXT,
+            tool_use_id   TEXT,
+            status        TEXT NOT NULL DEFAULT 'pending',
+            message       TEXT,
+            created_ts    REAL NOT NULL,
+            decided_ts    REAL
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -236,7 +279,7 @@ def _load_row(channel_id: int) -> Optional[sqlite3.Row]:
         conn.row_factory = sqlite3.Row
         return conn.execute(
             "SELECT project, session_id, model, runs, total_cost, "
-            "run_branch, branched_for_session, pre_run_ref "
+            "run_branch, branched_for_session, pre_run_ref, strict_mode "
             "FROM channel_state WHERE channel_id = ?",
             (channel_id,),
         ).fetchone()
@@ -254,8 +297,8 @@ def save_state(channel_id: int, st: "ChannelState") -> None:
             """
             INSERT INTO channel_state
                 (channel_id, project, session_id, model, runs, total_cost,
-                 run_branch, branched_for_session, pre_run_ref)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 run_branch, branched_for_session, pre_run_ref, strict_mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(channel_id) DO UPDATE SET
                 project              = excluded.project,
                 session_id           = excluded.session_id,
@@ -264,10 +307,11 @@ def save_state(channel_id: int, st: "ChannelState") -> None:
                 total_cost           = excluded.total_cost,
                 run_branch           = excluded.run_branch,
                 branched_for_session = excluded.branched_for_session,
-                pre_run_ref          = excluded.pre_run_ref
+                pre_run_ref          = excluded.pre_run_ref,
+                strict_mode          = excluded.strict_mode
             """,
             (channel_id, st.project, st.session_id, st.model, st.runs, st.total_cost,
-             st.run_branch, st.branched_for_session, st.pre_run_ref),
+             st.run_branch, st.branched_for_session, st.pre_run_ref, int(st.strict_mode)),
         )
         conn.commit()
     finally:
@@ -354,6 +398,8 @@ class ChannelState:
     run_branch: Optional[str] = None
     branched_for_session: Optional[str] = None
     pre_run_ref: Optional[str] = None
+    # Live permission prompts (Phase 1.3), persisted. See !strict.
+    strict_mode: bool = False
 
 STATE: dict[int, ChannelState] = {}
 
@@ -374,6 +420,7 @@ def state_for(channel_id: int) -> ChannelState:
                 run_branch=row["run_branch"],
                 branched_for_session=row["branched_for_session"],
                 pre_run_ref=row["pre_run_ref"],
+                strict_mode=bool(row["strict_mode"]),
             )
         else:
             st = ChannelState(project=DEFAULT_PROJECT)
@@ -386,8 +433,15 @@ def state_for(channel_id: int) -> ChannelState:
 # ---------------------------------------------------------------------------
 def build_command(prompt: str, session_id: Optional[str],
                   model: Optional[str] = None,
-                  permission_mode: Optional[str] = None) -> list[str]:
-    """Resolve the claude binary and assemble the headless invocation."""
+                  permission_mode: Optional[str] = None,
+                  allowed_tools: Optional[str] = None,
+                  mcp_config: Optional[str] = None) -> list[str]:
+    """Resolve the claude binary and assemble the headless invocation.
+
+    allowed_tools/mcp_config are the Phase 1.3 (!strict) hooks: when set, they
+    override the usual ALLOWED_TOOLS and add a --permission-prompt-tool wired to
+    a local MCP server (see run_claude), instead of the default acceptEdits.
+    """
     resolved = shutil.which(CLAUDE_BIN) or CLAUDE_BIN
     args = [
         resolved,
@@ -395,8 +449,10 @@ def build_command(prompt: str, session_id: Optional[str],
         "--output-format", "stream-json",
         "--verbose",
         "--permission-mode", permission_mode or PERMISSION_MODE,
-        "--allowedTools", ALLOWED_TOOLS,
+        "--allowedTools", allowed_tools or ALLOWED_TOOLS,
     ]
+    if mcp_config:
+        args += ["--permission-prompt-tool", "mcp__anton__approve", "--mcp-config", mcp_config]
     if model:
         args += ["--model", model]
     if session_id:
@@ -516,6 +572,29 @@ def summarize_tool(name: str, inp: dict) -> str:
     if name == "Task":
         return f"{icon} sub-agent: {short(inp.get('description', ''))}"
     return f"{icon} {name}"
+
+
+def describe_for_approval(tool_name: str, inp: dict) -> str:
+    """Fuller tool description for a live permission-prompt card (Phase 1.3) —
+    unlike summarize_tool()'s one-liner for the activity feed, a human approving
+    or denying a real action needs enough detail to actually judge it."""
+    icons = {"Bash": "🖥️", "Edit": "✏️", "Write": "📝", "WebFetch": "🌐",
+             "WebSearch": "🌐", "Task": "🤖"}
+    icon = icons.get(tool_name, "🔧")
+    if tool_name == "Bash":
+        cmd = preview(inp.get("command", ""), 350)
+        desc = inp.get("description")
+        extra = f"\n_{preview(desc, 150)}_" if desc else ""
+        return f"{icon} **Bash**\n```\n{cmd}\n```{extra}"
+    if tool_name in ("Edit", "Write"):
+        return f"{icon} **{tool_name}**: `{preview(inp.get('file_path', ''), 300)}`"
+    if tool_name == "WebFetch":
+        return f"{icon} **WebFetch**: {preview(inp.get('url', ''), 300)}"
+    if tool_name == "WebSearch":
+        return f"{icon} **WebSearch**: {preview(inp.get('query', ''), 300)}"
+    if tool_name == "Task":
+        return f"{icon} **sub-agent**: {preview(inp.get('description', ''), 300)}"
+    return f"{icon} **{tool_name}**\n```\n{preview(json.dumps(inp), 350)}\n```"
 
 
 def chunk(text: str, size: int = MAX_MSG) -> list[str]:
@@ -716,6 +795,15 @@ REVERT_BY_MESSAGE: dict[int, "RevertContext"] = {}
 RESULT_BY_MESSAGE: dict[int, "ResultContext"] = {}
 RESULT_MAP_MAX = 500
 
+# Live permission prompts (Phase 1.3). anton_mcp_approve.py runs as a separate
+# process (claude spawns it), so it can't touch Discord directly — it just writes
+# a pending row to the `approvals` table. APPROVAL_BY_MESSAGE maps the Discord
+# message carrying ✅/❌ back to that row's id; _POSTED_APPROVALS additionally holds
+# the Message object so approval_watcher() can edit it once resolved (by reaction,
+# handled instantly here, or by the helper's own timeout, only visible via polling).
+APPROVAL_BY_MESSAGE: dict[int, int] = {}
+_POSTED_APPROVALS: dict[int, discord.Message] = {}
+
 
 def _register_result(message_id: int, ctx: "ResultContext") -> None:
     """Record a result→session mapping, evicting the oldest once over the cap."""
@@ -739,6 +827,89 @@ async def _set_post_run_reactions(status: discord.Message):
         except discord.HTTPException:
             pass
 
+
+async def approval_watcher():
+    """Background task (Phase 1.3). anton_mcp_approve.py inserts pending rows into
+    the `approvals` table from a separate process — this loop is the other half
+    that notices them and turns them into Discord messages, polling since there's
+    no other way to be notified of a write from a different process.
+
+    Handles two things a reaction can't: (1) discovering a brand-new pending row
+    at all, and (2) reflecting the helper's own timeout-deny on the now-stale
+    message. An actual ✅/❌ reaction is handled instantly in on_reaction_add,
+    which edits the message itself — this loop just needs to not fight it (it
+    only touches messages still tracked in _POSTED_APPROVALS)."""
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            conn = _db()
+            try:
+                conn.row_factory = sqlite3.Row
+                pending = conn.execute(
+                    "SELECT id, channel_id, tool_name, input_json FROM approvals "
+                    "WHERE status = 'pending' ORDER BY id"
+                ).fetchall()
+            finally:
+                conn.close()
+
+            for row in pending:
+                if row["id"] in _POSTED_APPROVALS:
+                    continue  # already posted this run; watch it via the block below
+                channel = client.get_channel(row["channel_id"])
+                if channel is None:
+                    continue  # channel not in cache (yet) — try again next tick
+                try:
+                    inp = json.loads(row["input_json"] or "{}")
+                except json.JSONDecodeError:
+                    inp = {}
+                st = state_for(row["channel_id"])
+                body = (
+                    f"🔐 **Approval needed** · **{st.project or '?'}**\n"
+                    f"{describe_for_approval(row['tool_name'], inp)}\n"
+                    f"React ✅ to allow, ❌ to deny "
+                    f"(auto-denies in {APPROVAL_TIMEOUT_SECONDS // 60} min)."
+                )
+                try:
+                    msg = await channel.send(body[:MAX_MSG])
+                    await msg.add_reaction("✅")
+                    await msg.add_reaction("❌")
+                except discord.HTTPException:
+                    continue  # try again next tick rather than losing the request
+                APPROVAL_BY_MESSAGE[msg.id] = row["id"]
+                _POSTED_APPROVALS[row["id"]] = msg
+
+            # Catch resolutions a reaction didn't cause (i.e. the helper's own
+            # timeout-deny) — reactions already edit their own message in
+            # on_reaction_add and remove themselves from _POSTED_APPROVALS.
+            if _POSTED_APPROVALS:
+                ids = tuple(_POSTED_APPROVALS.keys())
+                conn = _db()
+                try:
+                    conn.row_factory = sqlite3.Row
+                    placeholders = ",".join("?" for _ in ids)
+                    rows = conn.execute(
+                        f"SELECT id, status, message FROM approvals WHERE id IN ({placeholders})",
+                        ids,
+                    ).fetchall()
+                finally:
+                    conn.close()
+                for row in rows:
+                    if row["status"] == "pending":
+                        continue
+                    msg = _POSTED_APPROVALS.pop(row["id"], None)
+                    if msg is None:
+                        continue
+                    APPROVAL_BY_MESSAGE.pop(msg.id, None)
+                    icon = "✅ Allowed" if row["status"] == "allow" else "❌ Denied"
+                    try:
+                        await msg.edit(content=f"{icon} — {row['message'] or ''}".strip())
+                        await msg.clear_reactions()
+                    except discord.HTTPException:
+                        pass
+        except Exception:  # noqa: BLE001 - a watcher hiccup must never crash the bot
+            pass
+        await asyncio.sleep(1.5)
+
 # ---------------------------------------------------------------------------
 # Core: run Claude Code and stream progress into a Discord message
 # ---------------------------------------------------------------------------
@@ -746,7 +917,34 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str, *,
                       permission_mode: Optional[str] = None, plan_mode: bool = False):
     channel_id = message.channel.id
     project_path = PROJECTS[st.project]
-    cmd = build_command(prompt, st.session_id, st.model, permission_mode)
+
+    # Live permission prompts (Phase 1.3): only for direct runs where the caller
+    # hasn't already forced a permission_mode (plan mode is its own read-only
+    # thing; the plan-approval executor deliberately forces acceptEdits since a
+    # human already reviewed the whole plan — strict mode isn't meant to relitigate
+    # that action-by-action). Everything else, when the channel has !strict on,
+    # swaps acceptEdits + the full ALLOWED_TOOLS for permission-mode "default" + a
+    # much smaller allowedTools, routing anything not in it through
+    # anton_mcp_approve.py for a live ✅/❌ Discord approval.
+    allowed_tools = None
+    mcp_config = None
+    if st.strict_mode and not plan_mode and permission_mode is None:
+        permission_mode = "default"
+        allowed_tools = STRICT_ALLOWED_TOOLS
+        mcp_config = json.dumps({
+            "mcpServers": {
+                "anton": {
+                    "command": sys.executable,
+                    "args": [APPROVE_SERVER_SCRIPT],
+                    "env": {
+                        "ANTON_DB": DB_PATH,
+                        "ANTON_CHANNEL_ID": str(channel_id),
+                        "ANTON_APPROVAL_TIMEOUT": str(APPROVAL_TIMEOUT_SECONDS),
+                    },
+                }
+            }
+        })
+    cmd = build_command(prompt, st.session_id, st.model, permission_mode, allowed_tools, mcp_config)
 
     icon = "📋" if plan_mode else "🧠"
     verb = "Planning" if plan_mode else "Working"
@@ -981,6 +1179,25 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str, *,
             st.proc = None
             if tick_task is not None and not tick_task.done():
                 tick_task.cancel()
+            if mcp_config:
+                # The run is over (however it ended) — any approval request still
+                # pending for this channel is orphaned (its anton_mcp_approve.py
+                # process died with the run). Deny it now rather than leaving a
+                # ✅/❌ card sitting in Discord forever; approval_watcher() will
+                # notice the status change and edit the message accordingly.
+                try:
+                    conn = _db()
+                    try:
+                        conn.execute(
+                            "UPDATE approvals SET status = 'deny', message = ?, "
+                            "decided_ts = ? WHERE channel_id = ? AND status = 'pending'",
+                            ("Run ended before this was resolved.", time.time(), channel_id),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                except Exception:  # noqa: BLE001 - best-effort cleanup only
+                    pass
             # Even on a timeout/error, `new_session` may hold a session id from
             # the init event — keep it so the next !cc can still --resume.
             if new_session:
@@ -1030,6 +1247,7 @@ HELP = (
     f"`{PREFIX}project [name]` — show or switch project\n"
     f"`{PREFIX}projects` — list projects\n"
     f"`{PREFIX}model [name]` — show or switch model (sonnet / opus / haiku / default)\n"
+    f"`{PREFIX}strict [on|off]` — live permission prompts: ask before Bash/Edit/etc.\n"
     f"`{PREFIX}usage` — runs, cost, and rate-limit utilization\n"
     f"`{PREFIX}history [n]` — recent runs in this channel; resume any of them\n"
     f"`{PREFIX}resume <id>` — resume the session from a past run\n"
@@ -1047,6 +1265,11 @@ HELP = (
     "**Reactions on a run's status message**\n"
     "🛑 cancel · 🔄 retry the same prompt · 📄 dump the full output as a file\n"
     "\n"
+    "**Live permission prompts**\n"
+    f"`{PREFIX}strict on` — Bash/Edit/Write/WebFetch/WebSearch/Task each post a "
+    "card with the exact command/file/URL; react ✅ to allow or ❌ to deny "
+    "(auto-denies after a timeout). Read/Glob/Grep/TodoWrite stay auto-allowed.\n"
+    "\n"
     "**Richer input**\n"
     "Attach files/images to `!cc` or `!plan` and Claude can read them. "
     "Reply to a result message to continue *that* session.\n"
@@ -1061,11 +1284,20 @@ def authorized(message: discord.Message) -> bool:
     return True
 
 
+_approval_watcher_started = False
+
+
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (id {client.user.id})")
     print(f"Allowed users: {ALLOWED_USER_IDS or 'NONE — nobody can use the bot!'}")
     print(f"Projects: {list(PROJECTS) or 'NONE — set PROJECTS'}")
+    # on_ready can fire more than once (e.g. after a reconnect) — only ever start
+    # the Phase 1.3 approval-polling task once.
+    global _approval_watcher_started
+    if not _approval_watcher_started:
+        _approval_watcher_started = True
+        client.loop.create_task(approval_watcher())
 
 
 @client.event
@@ -1134,6 +1366,33 @@ async def on_reaction_add(reaction: discord.Reaction, user):
                     )
         try:
             await reaction.remove(user)
+        except discord.HTTPException:
+            pass
+        return
+
+    # ✅ allow / ❌ deny on a live permission-prompt card (Phase 1.3).
+    appr_id = APPROVAL_BY_MESSAGE.get(msg.id)
+    if appr_id is not None:
+        if emoji not in ("✅", "❌"):
+            return
+        APPROVAL_BY_MESSAGE.pop(msg.id, None)
+        _POSTED_APPROVALS.pop(appr_id, None)  # claim it so approval_watcher() won't race us
+        status = "allow" if emoji == "✅" else "deny"
+        reason = f"{'Allowed' if status == 'allow' else 'Denied'} via Discord by {user.display_name}."
+        conn = _db()
+        try:
+            conn.execute(
+                "UPDATE approvals SET status = ?, message = ?, decided_ts = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (status, reason, time.time(), appr_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        icon = "✅ Allowed" if status == "allow" else "❌ Denied"
+        try:
+            await msg.edit(content=f"{icon} — {reason}")
+            await msg.clear_reactions()
         except discord.HTTPException:
             pass
         return
@@ -1261,6 +1520,29 @@ async def on_message(message: discord.Message):
             st.model = arg.lower() if arg.lower() in KNOWN_MODELS else arg
             save_state(message.channel.id, st)
             await message.reply(f"Model set to **{st.model}** for this channel.")
+
+    elif cmd == "strict":
+        if not arg:
+            state = "on" if st.strict_mode else "off"
+            await message.reply(
+                f"Live permission prompts are **{state}** for this channel.\n"
+                f"`{PREFIX}strict on` routes Bash/Edit/Write/etc. through a ✅/❌ "
+                f"Discord approval instead of auto-accepting them; "
+                f"`{PREFIX}strict off` goes back to `{PERMISSION_MODE}`."
+            )
+        elif arg.lower() in ("on", "true", "1", "yes"):
+            st.strict_mode = True
+            save_state(message.channel.id, st)
+            await message.reply(
+                "🔐 Strict mode **on** — future runs in this channel will ask "
+                "before Bash/Edit/Write/etc. (react ✅/❌ on the prompt)."
+            )
+        elif arg.lower() in ("off", "false", "0", "no"):
+            st.strict_mode = False
+            save_state(message.channel.id, st)
+            await message.reply(f"Strict mode **off** — back to `{PERMISSION_MODE}` for this channel.")
+        else:
+            await message.reply(f"Usage: `{PREFIX}strict [on|off]`.")
 
     elif cmd == "usage":
         lines = [
