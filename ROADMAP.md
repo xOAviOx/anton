@@ -83,7 +83,19 @@ A Discord bridge is uniquely good at approval loops you can drive from your phon
 Right now Claude edits the working tree in place with no safety net. Make git the
 safety layer. All of these shell out with `cwd=PROJECTS[st.project]`.
 
-### 2.1 Auto-branch per run 🟢
+> **Implementation notes (2.1–2.3 shipped):** branch names get a short uuid
+> suffix (`anton/<ts>-<uuid>`) so two runs starting in the same second don't
+> collide. Branch creation is idempotent per session — it fires only while
+> `run_branch` is unset, and `run_branch` is cleared on session reset (`!new` /
+> project switch), so follow-up messages reuse the one branch instead of each
+> forking a new one. A `pre_run_ref` (HEAD before the run) is captured on
+> **every** run, so `!diff` and `!revert` work even with `AUTO_BRANCH=0`.
+> `!revert` also runs `git clean -fd` to drop untracked files, and asks for a ✅
+> first. New DB columns (`run_branch`, `branched_for_session`, `pre_run_ref`)
+> are added by an `ALTER TABLE` migration so pre-Phase-2 databases upgrade in
+> place.
+
+### 2.1 Auto-branch per run 🟢 ✅ done
 
 - **What:** Create `anton/<timestamp>` before each run so changes are isolated and
   reviewable. Configurable via `AUTO_BRANCH=1`.
@@ -91,14 +103,14 @@ safety layer. All of these shell out with `cwd=PROJECTS[st.project]`.
   the tree is dirty or not a git repo — warn instead). Record the branch on
   `ChannelState`.
 
-### 2.2 `!diff` 🟢
+### 2.2 `!diff` 🟢 ✅ done
 
 - **What:** Post `git diff --stat` for the current run's changes; offer the full
   diff as a file attachment if it's large.
 - **How:** Run `git diff --stat` (and `git diff` for the attachment) in the project
   dir; chunk or attach via `discord.File`.
 
-### 2.3 `!revert` / `!undo` 🟢
+### 2.3 `!revert` / `!undo` 🟢 ✅ done
 
 - **What:** Throw away a bad run's changes.
 - **How:** `git reset --hard` to the pre-run ref (capture `git rev-parse HEAD`

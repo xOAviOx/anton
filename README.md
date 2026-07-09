@@ -12,6 +12,8 @@ progress tool calls, file edits, and the final answer back into the channel.
   dump the full output as a file
 - Plan → approve → execute: `!plan` drafts a read-only plan and waits for a ✅
   reaction before touching your files
+- Git safety net: optional per-session auto-branching, `!diff` to review a run's
+  changes, and `!revert` to throw them away
 - Multiple projects, switchable per channel
 - Session continuity so follow-up messages continue the same conversation
 - State (project, session, usage) survives bot restarts
@@ -104,6 +106,30 @@ two reactions to it:
 Because execution resumes the planning session, Claude keeps the full context of
 what it proposed. If you 🔄 retry a plan's status message it re-plans rather than
 executing. As with run controls, only the latest plan per channel stays live.
+
+## Git safety net
+
+Claude edits your working tree directly. These commands make git the safety layer
+so a bad run is easy to review and undo. They shell out with `git` in the current
+project directory and no-op gracefully if it isn't a git repo.
+
+| Command | Effect |
+| --- | --- |
+| `!diff` | Show what the current session changed — `git diff --stat` inline plus the full patch as a `.diff` attachment |
+| `!revert` / `!undo` | Reset the project back to the checkpoint taken before the last run (`git reset --hard` + `git clean -fd`), after a ✅ confirmation |
+
+Before every run the bot records the project's current `HEAD` as a checkpoint, so
+`!diff` and `!revert` work even without auto-branching.
+
+Set `AUTO_BRANCH=1` to go a step further: the first run of each session creates an
+`anton/<timestamp>-<uuid>` branch and switches to it, so that session's edits are
+isolated from your working branch. Follow-up messages in the same session stay on
+that branch; `!new` or switching projects starts a fresh one. Auto-branching is
+skipped when the tree is already dirty (the bot leaves your uncommitted work
+alone and edits in place instead).
+
+Because `!revert` runs `git reset --hard` and `git clean -fd`, it permanently
+discards uncommitted work — that's why it always asks first.
 
 ## Security
 

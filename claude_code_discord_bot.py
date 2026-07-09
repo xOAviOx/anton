@@ -15,6 +15,8 @@ Commands (default prefix "!"):
   !new              Start a fresh session for this channel.
   !project [name]   Show the current project, or switch to a configured one.
   !projects         List configured projects.
+  !diff             Show what the current session changed (stat + full patch).
+  !revert / !undo   Throw away the last run's changes (asks to confirm first).
   !status           Show current project + session + whether a run is active.
   !cancel           Kill the currently running Claude Code process.
   !help             Show this help.
@@ -22,6 +24,9 @@ Commands (default prefix "!"):
 Every run's status message also carries reaction controls: 🛑 cancel (works
 even while a run is still queued behind MAX_CONCURRENT), 🔄 retry the same
 prompt, 📄 dump the full output as a file attachment.
+
+With AUTO_BRANCH=1, each fresh session's edits are isolated on an `anton/<ts>`
+git branch so they're easy to review (!diff) or discard (!revert).
 
 Each Discord channel keeps its own project + session, so you can run several
 projects in parallel from different channels.
@@ -80,6 +85,7 @@ import signal
 import sqlite3
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -119,6 +125,11 @@ DB_PATH = os.getenv(
 # Global cap on simultaneous `claude` processes, across all channels.
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "2"))
 
+# Git safety net (Phase 2). When on, each fresh session auto-creates an
+# `anton/<ts>-<uuid>` branch in the project before Claude touches the tree, so a
+# run's edits are isolated and reviewable (!diff) or throwable-away (!revert).
+AUTO_BRANCH = os.getenv("AUTO_BRANCH", "0").strip().lower() in ("1", "true", "yes", "on")
+
 # Projects: env JSON wins, else edit this dict directly.
 _PROJECTS_ENV = os.getenv("PROJECTS")
 if _PROJECTS_ENV:
@@ -156,6 +167,16 @@ def _db() -> sqlite3.Connection:
         )
         """
     )
+    # Phase 2 git-safety columns, added by migration so pre-Phase-2 databases
+    # upgrade in place. run_branch: the anton/… branch for the current session;
+    # branched_for_session: which session_id we already branched for (idempotence);
+    # pre_run_ref: HEAD captured before the latest run, for !revert.
+    for col in ("run_branch TEXT", "branched_for_session TEXT", "pre_run_ref TEXT"):
+        try:
+            conn.execute(f"ALTER TABLE channel_state ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass  # duplicate column — already migrated
+    conn.commit()
     return conn
 
 
@@ -164,7 +185,8 @@ def _load_row(channel_id: int) -> Optional[sqlite3.Row]:
     try:
         conn.row_factory = sqlite3.Row
         return conn.execute(
-            "SELECT project, session_id, model, runs, total_cost "
+            "SELECT project, session_id, model, runs, total_cost, "
+            "run_branch, branched_for_session, pre_run_ref "
             "FROM channel_state WHERE channel_id = ?",
             (channel_id,),
         ).fetchone()
@@ -180,16 +202,22 @@ def save_state(channel_id: int, st: "ChannelState") -> None:
     try:
         conn.execute(
             """
-            INSERT INTO channel_state (channel_id, project, session_id, model, runs, total_cost)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO channel_state
+                (channel_id, project, session_id, model, runs, total_cost,
+                 run_branch, branched_for_session, pre_run_ref)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(channel_id) DO UPDATE SET
-                project    = excluded.project,
-                session_id = excluded.session_id,
-                model      = excluded.model,
-                runs       = excluded.runs,
-                total_cost = excluded.total_cost
+                project              = excluded.project,
+                session_id           = excluded.session_id,
+                model                = excluded.model,
+                runs                 = excluded.runs,
+                total_cost           = excluded.total_cost,
+                run_branch           = excluded.run_branch,
+                branched_for_session = excluded.branched_for_session,
+                pre_run_ref          = excluded.pre_run_ref
             """,
-            (channel_id, st.project, st.session_id, st.model, st.runs, st.total_cost),
+            (channel_id, st.project, st.session_id, st.model, st.runs, st.total_cost,
+             st.run_branch, st.branched_for_session, st.pre_run_ref),
         )
         conn.commit()
     finally:
@@ -210,6 +238,12 @@ class ChannelState:
     runs: int = 0
     total_cost: float = 0.0
     last_rate_limit: Optional[dict] = None  # most recent rate_limit_event payload (not persisted)
+    # Git safety net (Phase 2), persisted. run_branch is the isolation branch for
+    # the current session; branched_for_session records the session it was made
+    # for; pre_run_ref is HEAD just before the latest run (the !revert target).
+    run_branch: Optional[str] = None
+    branched_for_session: Optional[str] = None
+    pre_run_ref: Optional[str] = None
 
 STATE: dict[int, ChannelState] = {}
 
@@ -227,6 +261,9 @@ def state_for(channel_id: int) -> ChannelState:
                 model=row["model"] if row["model"] is not None else (CLAUDE_MODEL or None),
                 runs=row["runs"],
                 total_cost=row["total_cost"],
+                run_branch=row["run_branch"],
+                branched_for_session=row["branched_for_session"],
+                pre_run_ref=row["pre_run_ref"],
             )
         else:
             st = ChannelState(project=DEFAULT_PROJECT)
@@ -332,6 +369,73 @@ async def kill(proc: Optional[asyncio.subprocess.Process]):
         _signal(signal.SIGKILL)
 
 # ---------------------------------------------------------------------------
+# Git safety net (Phase 2): auto-branch, diff, revert. All shell out in the
+# project directory. These are best-effort — a non-git project just skips them.
+# ---------------------------------------------------------------------------
+async def _git(cwd: str, *args: str) -> tuple[int, str, str]:
+    """Run `git <args>` in cwd. Returns (returncode, stdout, stderr), stripped."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", *args, cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    return (
+        proc.returncode if proc.returncode is not None else -1,
+        out.decode(errors="replace").strip(),
+        err.decode(errors="replace").strip(),
+    )
+
+
+async def _is_git_repo(cwd: str) -> bool:
+    code, out, _ = await _git(cwd, "rev-parse", "--is-inside-work-tree")
+    return code == 0 and out == "true"
+
+
+async def _ensure_branch(st: ChannelState, project_path: str) -> Optional[str]:
+    """Called before every run. Always records pre_run_ref (HEAD) so !revert has a
+    target. When AUTO_BRANCH is on and this session hasn't branched yet, create an
+    isolation branch `anton/<ts>-<uuid>` and switch to it. Returns the name of a
+    branch newly created on this call (for a one-time notice), else None.
+
+    Idempotent per session: branched_for_session is keyed to session_id so
+    follow-up messages in the same session stay on the one branch instead of
+    forking a new one each time.
+    """
+    if not await _is_git_repo(project_path):
+        return None
+
+    code, head, _ = await _git(project_path, "rev-parse", "HEAD")
+    if code == 0 and head:
+        st.pre_run_ref = head  # capture per run, for !revert
+
+    if not AUTO_BRANCH:
+        return None
+    # Branch exactly once per session: run_branch is set on creation and cleared
+    # on session reset (!new / !project switch), so follow-up messages in the same
+    # session reuse the one branch instead of each forking a new one.
+    if st.run_branch:
+        return None
+
+    # Don't fork off a dirty tree — warn instead (handled by caller via return).
+    code, dirty, _ = await _git(project_path, "status", "--porcelain")
+    if code != 0:
+        return None
+    if dirty:
+        return None  # caller leaves the tree as-is; auto-branch skipped this run
+
+    # ts + short uuid so two branches made in the same second don't collide.
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    branch = f"anton/{ts}-{uuid.uuid4().hex[:6]}"
+    code, _, err = await _git(project_path, "switch", "-c", branch)
+    if code != 0:
+        return None
+    st.run_branch = branch
+    st.branched_for_session = st.session_id  # informational (may backfill later)
+    return branch
+
+
+# ---------------------------------------------------------------------------
 # Reaction controls: 🛑 cancel / 🔄 retry / 📄 dump output on run status
 # messages, and ✅ execute / 🛑 discard on plan-mode proposals.
 # ---------------------------------------------------------------------------
@@ -352,10 +456,17 @@ class PlanContext:
     prompt: str
     trigger_message: discord.Message
 
+@dataclass
+class RevertContext:
+    channel_id: int
+    ref: str      # pre-run HEAD to reset back to
+    project: str
+
 # Keyed by the Discord message id carrying the controls. Pruned to the most
 # recent entry per channel (see run_claude) so these stay small forever.
 RUN_BY_MESSAGE: dict[int, RunContext] = {}
 PLAN_BY_MESSAGE: dict[int, PlanContext] = {}
+REVERT_BY_MESSAGE: dict[int, "RevertContext"] = {}
 
 
 async def _set_post_run_reactions(status: discord.Message):
@@ -442,6 +553,20 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str, *,
             if ctx.cancelled:
                 await status.edit(content=f"🛑 cancelled (was queued) · **{st.project}**")
                 return
+
+            # Git safety net: record the pre-run ref and (if AUTO_BRANCH) isolate
+            # this session's edits on an anton/… branch. Skipped for plan mode,
+            # which is read-only. Best-effort — non-git projects just no-op.
+            if not plan_mode:
+                try:
+                    new_branch = await _ensure_branch(st, project_path)
+                    if new_branch:
+                        await message.channel.send(
+                            f"🌿 Isolating changes on branch `{new_branch}`."
+                        )
+                except Exception:  # noqa: BLE001 - git must never break a run
+                    pass
+
             spawn_kwargs = {}
             if os.name != "nt":
                 # Own process group so kill() can signal the whole tree, not just
@@ -601,6 +726,11 @@ HELP = (
     f"`{PREFIX}status` — current project / session / activity\n"
     f"`{PREFIX}cancel` — kill the running task\n"
     "\n"
+    "**Git safety net**\n"
+    f"`{PREFIX}diff` — show what the current session changed (stat + full patch)\n"
+    f"`{PREFIX}revert` — throw away the last run's changes (asks to confirm)\n"
+    "Set `AUTO_BRANCH=1` to isolate each session's edits on an `anton/…` branch.\n"
+    "\n"
     "**Reactions on a run's status message**\n"
     "🛑 cancel · 🔄 retry the same prompt · 📄 dump the full output as a file\n"
 )
@@ -652,6 +782,38 @@ async def on_reaction_add(reaction: discord.Reaction, user):
                     await run_claude(
                         plan.trigger_message, st, plan.prompt,
                         permission_mode="acceptEdits",
+                    )
+        try:
+            await reaction.remove(user)
+        except discord.HTTPException:
+            pass
+        return
+
+    # ✅ confirm / 🛑 keep on a revert confirmation (Phase 2.3).
+    rev = REVERT_BY_MESSAGE.get(msg.id)
+    if rev is not None:
+        if emoji not in ("✅", "🛑"):
+            return
+        REVERT_BY_MESSAGE.pop(msg.id, None)  # one decision per confirmation
+        st = state_for(rev.channel_id)
+        if emoji == "🛑":
+            await channel.send("🛑 Revert cancelled — your changes are untouched.")
+        elif st.proc and st.proc.returncode is None:
+            await channel.send("A run started meanwhile — cancel it first, then revert.")
+        else:
+            project_path = PROJECTS.get(rev.project)
+            if not project_path:
+                await channel.send(f"Project `{rev.project}` is no longer configured.")
+            else:
+                code, _, err = await _git(project_path, "reset", "--hard", rev.ref)
+                if code != 0:
+                    await channel.send(f"❌ Revert failed:\n```\n{err[:1500]}\n```")
+                else:
+                    await _git(project_path, "clean", "-fd")  # drop untracked files too
+                    st.pre_run_ref = None  # checkpoint consumed
+                    save_state(rev.channel_id, st)
+                    await channel.send(
+                        f"↩️ Reverted **{rev.project}** to `{rev.ref[:8]}`."
                     )
         try:
             await reaction.remove(user)
@@ -725,6 +887,7 @@ async def on_message(message: discord.Message):
         else:
             st.project = arg
             st.session_id = None  # sessions are scoped to a directory
+            st.run_branch = st.branched_for_session = st.pre_run_ref = None
             save_state(message.channel.id, st)
             await message.reply(f"Switched to **{arg}** (fresh session).")
 
@@ -765,6 +928,8 @@ async def on_message(message: discord.Message):
 
     elif cmd == "new":
         st.session_id = None
+        # New session → next run branches fresh instead of reusing the old one.
+        st.run_branch = st.branched_for_session = st.pre_run_ref = None
         save_state(message.channel.id, st)
         await message.reply(f"Started a fresh session for **{st.project or 'none'}**.")
 
@@ -814,6 +979,69 @@ async def on_message(message: discord.Message):
             return
         async with st.lock:
             await run_claude(message, st, arg, plan_mode=True)
+
+    elif cmd == "diff":
+        if not st.project or st.project not in PROJECTS:
+            await message.reply(f"No valid project set. Use `{PREFIX}project <name>`.")
+            return
+        project_path = PROJECTS[st.project]
+        if not await _is_git_repo(project_path):
+            await message.reply(f"**{st.project}** isn't a git repository — nothing to diff.")
+            return
+        # Diff against the pre-run ref when we have one (shows exactly what this
+        # session changed, staged + unstaged + untracked), else the working tree.
+        base = st.pre_run_ref
+        stat_args = ["diff", "--stat"] + ([base] if base else [])
+        full_args = ["diff"] + ([base] if base else [])
+        _, stat, _ = await _git(project_path, *stat_args)
+        _, patch, _ = await _git(project_path, *full_args)
+        against = f"since last run (`{base[:8]}`)" if base else "in the working tree"
+        if not stat and not patch:
+            await message.reply(f"No changes {against} in **{st.project}**.")
+            return
+        header = f"📊 **Diff {against}** · {st.project}\n```\n{stat[:MAX_MSG - 200]}\n```"
+        await message.reply(header)
+        if patch:
+            await message.channel.send(
+                file=discord.File(io.BytesIO(patch.encode("utf-8")), filename="changes.diff")
+            )
+
+    elif cmd in ("revert", "undo"):
+        if not st.project or st.project not in PROJECTS:
+            await message.reply(f"No valid project set. Use `{PREFIX}project <name>`.")
+            return
+        if st.proc and st.proc.returncode is None:
+            await message.reply(
+                f"A run is active — `{PREFIX}cancel` it before reverting."
+            )
+            return
+        project_path = PROJECTS[st.project]
+        if not await _is_git_repo(project_path):
+            await message.reply(f"**{st.project}** isn't a git repository — nothing to revert.")
+            return
+        if not st.pre_run_ref:
+            await message.reply(
+                "No pre-run checkpoint recorded yet — run something first, then "
+                f"`{PREFIX}revert` throws away that run's changes."
+            )
+            return
+        # Show what would be discarded and ask for a ✅ before destroying work.
+        _, stat, _ = await _git(project_path, "diff", "--stat", st.pre_run_ref)
+        preview = (f"```\n{stat[:1500]}\n```" if stat else "_(no tracked changes; "
+                   "untracked files will also be cleaned)_")
+        warn = await message.reply(
+            f"⚠️ **Revert {st.project} to `{st.pre_run_ref[:8]}`?**\n{preview}\n"
+            "This runs `git reset --hard` + `git clean -fd` and **cannot be undone**.\n"
+            "React ✅ to confirm or 🛑 to keep your changes."
+        )
+        REVERT_BY_MESSAGE[warn.id] = RevertContext(
+            channel_id=message.channel.id, ref=st.pre_run_ref, project=st.project,
+        )
+        try:
+            await warn.add_reaction("✅")
+            await warn.add_reaction("🛑")
+        except discord.HTTPException:
+            pass
 
 
 def main():
