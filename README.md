@@ -55,6 +55,7 @@ Key options:
 | `CLAUDE_BIN` | Path to the `claude` binary if not on `PATH` |
 | `PERMISSION_MODE` | `acceptEdits` to auto-approve writes, or `default` |
 | `RUN_TIMEOUT` | Hard timeout per run, in seconds |
+| `MAX_CONCURRENT` | Max `claude` processes running at once, across all channels (default `2`) |
 | `ANTON_DB` | Path to the SQLite file used to persist per-channel state across restarts (default `anton.db` next to the script) |
 
 ## Persistence

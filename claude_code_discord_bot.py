@@ -109,6 +109,9 @@ DB_PATH = os.getenv(
     "ANTON_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "anton.db")
 )
 
+# Global cap on simultaneous `claude` processes, across all channels.
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "2"))
+
 # Projects: env JSON wins, else edit this dict directly.
 _PROJECTS_ENV = os.getenv("PROJECTS")
 if _PROJECTS_ENV:
@@ -202,6 +205,9 @@ class ChannelState:
     last_rate_limit: Optional[dict] = None  # most recent rate_limit_event payload (not persisted)
 
 STATE: dict[int, ChannelState] = {}
+
+# Caps how many `claude` processes can run at once across all channels/projects.
+RUN_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT)
 
 def state_for(channel_id: int) -> ChannelState:
     st = STATE.get(channel_id)
@@ -352,114 +358,123 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str):
 
     tick_task: Optional[asyncio.Task] = None
 
-    try:
-        spawn_kwargs = {}
-        if os.name != "nt":
-            # Own process group so kill() can signal the whole tree, not just
-            # the `claude` parent (it spawns bash/subagents/MCP children).
-            spawn_kwargs["start_new_session"] = True
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, cwd=project_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            **spawn_kwargs,
-        )
-        st.proc = proc
+    if RUN_SEMAPHORE.locked():
+        try:
+            await status.edit(
+                content=f"⏳ queued · **{st.project}** (max {MAX_CONCURRENT} concurrent runs)…"
+            )
+        except discord.HTTPException:
+            pass
 
-        stderr_task = asyncio.create_task(proc.stderr.read())
-        tick_task = asyncio.create_task(ticker())
+    async with RUN_SEMAPHORE:
+        try:
+            spawn_kwargs = {}
+            if os.name != "nt":
+                # Own process group so kill() can signal the whole tree, not just
+                # the `claude` parent (it spawns bash/subagents/MCP children).
+                spawn_kwargs["start_new_session"] = True
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, cwd=project_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                **spawn_kwargs,
+            )
+            st.proc = proc
 
-        async def read_stream():
-            nonlocal final_text, new_session, cost, is_error
-            if proc.stdout is None:
-                return
-            async for raw in proc.stdout:
-                line = raw.decode(errors="replace").strip()
-                if not line:
-                    continue
-                try:
-                    evt = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                etype = evt.get("type")
+            stderr_task = asyncio.create_task(proc.stderr.read())
+            tick_task = asyncio.create_task(ticker())
 
-                if etype == "system":
-                    if evt.get("subtype") == "init":
+            async def read_stream():
+                nonlocal final_text, new_session, cost, is_error
+                if proc.stdout is None:
+                    return
+                async for raw in proc.stdout:
+                    line = raw.decode(errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    etype = evt.get("type")
+
+                    if etype == "system":
+                        if evt.get("subtype") == "init":
+                            new_session = evt.get("session_id", new_session)
+                        elif evt.get("subtype") == "api_retry":
+                            activity.append(f"⏳ retrying ({evt.get('error', 'error')})…")
+
+                    elif etype == "assistant":
+                        for block in evt.get("message", {}).get("content", []):
+                            if block.get("type") == "tool_use":
+                                activity.append(summarize_tool(block.get("name", "?"),
+                                                               block.get("input", {})))
+
+                    elif etype == "result":
+                        final_text = evt.get("result") or final_text
                         new_session = evt.get("session_id", new_session)
-                    elif evt.get("subtype") == "api_retry":
-                        activity.append(f"⏳ retrying ({evt.get('error', 'error')})…")
+                        cost = evt.get("total_cost_usd", cost)
+                        is_error = bool(evt.get("is_error"))
 
-                elif etype == "assistant":
-                    for block in evt.get("message", {}).get("content", []):
-                        if block.get("type") == "tool_use":
-                            activity.append(summarize_tool(block.get("name", "?"),
-                                                           block.get("input", {})))
+                    elif etype == "rate_limit_event":
+                        info = evt.get("rate_limit_info")
+                        if info:
+                            st.last_rate_limit = info
 
-                elif etype == "result":
-                    final_text = evt.get("result") or final_text
-                    new_session = evt.get("session_id", new_session)
-                    cost = evt.get("total_cost_usd", cost)
-                    is_error = bool(evt.get("is_error"))
+                    if time.monotonic() - last_edit > STATUS_EDIT_INTERVAL:
+                        await render()
 
-                elif etype == "rate_limit_event":
-                    info = evt.get("rate_limit_info")
-                    if info:
-                        st.last_rate_limit = info
+            await asyncio.wait_for(read_stream(), timeout=RUN_TIMEOUT)
+            await proc.wait()
 
-                if time.monotonic() - last_edit > STATUS_EDIT_INTERVAL:
-                    await render()
-
-        await asyncio.wait_for(read_stream(), timeout=RUN_TIMEOUT)
-        await proc.wait()
-
-        tick_task.cancel()
-        stderr_bytes = await stderr_task
-        stderr = stderr_bytes.decode(errors="replace")
-
-        st.session_id = new_session  # persist for next !cc
-        st.runs += 1
-        if cost is not None:
-            st.total_cost += cost
-
-        # Final status line
-        footer = f"✅ done · **{st.project}**"
-        if cost is not None:
-            footer += f" · ${cost:.4f}"
-        if is_error or proc.returncode not in (0, None):
-            footer = f"⚠️ finished with issues · **{st.project}** (exit {proc.returncode})"
-        await status.edit(content=footer[:MAX_MSG])
-
-        pieces = chunk(final_text) or ["_(no textual output)_"]
-        for p in pieces:
-            await message.channel.send(p)
-        if (is_error or proc.returncode not in (0, None)) and stderr.strip():
-            for p in chunk("stderr:\n" + stderr):
-                await message.channel.send(f"```\n{p}\n```")
-
-    except asyncio.TimeoutError:
-        await kill(st.proc)
-        await status.edit(content=f"⏱️ timed out after {RUN_TIMEOUT}s · **{st.project}**")
-    except FileNotFoundError:
-        await status.edit(
-            content="❌ `claude` not found. Install Claude Code and make sure it's on PATH "
-                    "(or set CLAUDE_BIN to the full path)."
-        )
-    except asyncio.CancelledError:
-        await kill(st.proc)
-        await status.edit(content=f"🛑 cancelled · **{st.project}**")
-        raise
-    except Exception as e:  # noqa: BLE001 - surface anything else to the user
-        await kill(st.proc)
-        await status.edit(content=f"❌ error: {type(e).__name__}: {str(e)[:400]}")
-    finally:
-        st.proc = None
-        if tick_task is not None and not tick_task.done():
             tick_task.cancel()
-        # Even on a timeout/error, `new_session` may hold a session id from
-        # the init event — keep it so the next !cc can still --resume.
-        if new_session:
-            st.session_id = new_session
-        save_state(channel_id, st)
+            stderr_bytes = await stderr_task
+            stderr = stderr_bytes.decode(errors="replace")
+
+            st.session_id = new_session  # persist for next !cc
+            st.runs += 1
+            if cost is not None:
+                st.total_cost += cost
+
+            # Final status line
+            footer = f"✅ done · **{st.project}**"
+            if cost is not None:
+                footer += f" · ${cost:.4f}"
+            if is_error or proc.returncode not in (0, None):
+                footer = f"⚠️ finished with issues · **{st.project}** (exit {proc.returncode})"
+            await status.edit(content=footer[:MAX_MSG])
+
+            pieces = chunk(final_text) or ["_(no textual output)_"]
+            for p in pieces:
+                await message.channel.send(p)
+            if (is_error or proc.returncode not in (0, None)) and stderr.strip():
+                for p in chunk("stderr:\n" + stderr):
+                    await message.channel.send(f"```\n{p}\n```")
+
+        except asyncio.TimeoutError:
+            await kill(st.proc)
+            await status.edit(content=f"⏱️ timed out after {RUN_TIMEOUT}s · **{st.project}**")
+        except FileNotFoundError:
+            await status.edit(
+                content="❌ `claude` not found. Install Claude Code and make sure it's on PATH "
+                        "(or set CLAUDE_BIN to the full path)."
+            )
+        except asyncio.CancelledError:
+            await kill(st.proc)
+            await status.edit(content=f"🛑 cancelled · **{st.project}**")
+            raise
+        except Exception as e:  # noqa: BLE001 - surface anything else to the user
+            await kill(st.proc)
+            await status.edit(content=f"❌ error: {type(e).__name__}: {str(e)[:400]}")
+        finally:
+            st.proc = None
+            if tick_task is not None and not tick_task.done():
+                tick_task.cancel()
+            # Even on a timeout/error, `new_session` may hold a session id from
+            # the init event — keep it so the next !cc can still --resume.
+            if new_session:
+                st.session_id = new_session
+            save_state(channel_id, st)
 
 # ---------------------------------------------------------------------------
 # Discord client + command handling

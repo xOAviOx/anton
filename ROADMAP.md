@@ -16,7 +16,7 @@ Legend — effort: 🟢 easy (≤ ~40 lines) · 🟡 medium · 🔴 involved.
 
 These aren't user-facing features, but the feature phases below depend on them.
 
-### 0.1 Durable state 🟢
+### 0.1 Durable state 🟢 ✅ done
 
 - **Problem:** `STATE: dict[int, ChannelState]` is in-memory; a restart loses every
   channel's `session_id`, cost totals, and project selection.
@@ -25,7 +25,7 @@ These aren't user-facing features, but the feature phases below depend on them.
   session_id, model, runs, total_cost`.
 - **Unlocks:** history, budgets, resume-after-restart.
 
-### 0.2 Process-group kill 🟢
+### 0.2 Process-group kill 🟢 ✅ done
 
 - **Problem:** `kill()` terminates only the `claude` parent; bash/subagent/MCP
   children can be orphaned.
@@ -33,7 +33,7 @@ These aren't user-facing features, but the feature phases below depend on them.
   signal the whole group (`os.killpg(os.getpgid(proc.pid), SIGTERM/SIGKILL)`).
   Update `kill()` in place.
 
-### 0.3 Global concurrency cap 🟢
+### 0.3 Global concurrency cap 🟢 ✅ done
 
 - **Problem:** Per-channel lock exists, but N channels can each spawn a heavy run.
 - **How:** Module-level `asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT", "2")))`
