@@ -8,8 +8,12 @@ progress tool calls, file edits, and the final answer back into the channel.
 
 - Run Claude Code sessions from any Discord channel you authorize
 - Live progress: streamed tool-use summaries while Claude works
+- Reaction controls on every run: 🛑 cancel (even while queued), 🔄 retry, 📄
+  dump the full output as a file
 - Multiple projects, switchable per channel
 - Session continuity so follow-up messages continue the same conversation
+- State (project, session, usage) survives bot restarts
+- A global concurrency cap keeps too many `claude` processes from piling up
 - Long replies are automatically split to fit Discord's message limit
 - Locked down to specific users (and optionally specific channels)
 
@@ -23,7 +27,11 @@ progress tool calls, file edits, and the final answer back into the channel.
 
 2. Create a Discord application and bot at the
    [Discord Developer Portal](https://discord.com/developers/applications),
-   enable the **Message Content Intent**, and invite it to your server.
+   enable the **Message Content Intent**, and invite it with these permissions:
+   Send Messages, Read Message History, Add Reactions. Also grant **Manage
+   Messages** if you want the same reaction (🛑/🔄/📄) to be clickable more
+   than once per run — without it the bot can still add its own reactions and
+   read yours, it just can't clear a reaction after acting on it.
 
 3. Copy the example env file and fill in your values:
 
@@ -66,6 +74,19 @@ SQLite database (`anton.db` by default) after every run and every `!project` /
 and Claude Code session — `!cc` will `--resume` where it left off instead of
 starting fresh. Delete `anton.db` (or point `ANTON_DB` elsewhere) to reset all
 channel state.
+
+## Reaction controls
+
+Every run's status message carries its own reaction controls:
+
+| Reaction | Effect |
+| --- | --- |
+| 🛑 | Cancel — kills the process if running, or stops it before it starts if still queued |
+| 🔄 | Retry — reruns the exact same prompt from scratch |
+| 📄 | Dump the full output as a `.md` file attachment |
+
+Only the most recent run per channel has live controls; older status
+messages' reactions become inert once a newer run starts.
 
 ## Security
 

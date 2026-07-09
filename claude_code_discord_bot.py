@@ -17,6 +17,10 @@ Commands (default prefix "!"):
   !cancel           Kill the currently running Claude Code process.
   !help             Show this help.
 
+Every run's status message also carries reaction controls: 🛑 cancel (works
+even while a run is still queued behind MAX_CONCURRENT), 🔄 retry the same
+prompt, 📄 dump the full output as a file attachment.
+
 Each Discord channel keeps its own project + session, so you can run several
 projects in parallel from different channels.
 
@@ -66,6 +70,7 @@ whole point of remote control). So:
 """
 
 import asyncio
+import io
 import json
 import os
 import shutil
@@ -324,6 +329,38 @@ async def kill(proc: Optional[asyncio.subprocess.Process]):
         _signal(signal.SIGKILL)
 
 # ---------------------------------------------------------------------------
+# Reaction controls: 🛑 cancel / 🔄 retry / 📄 dump output on run status
+# messages.
+# ---------------------------------------------------------------------------
+@dataclass
+class RunContext:
+    channel_id: int
+    prompt: str
+    trigger_message: discord.Message
+    final_text: str = ""
+    cancelled: bool = False  # set by a 🛑 reaction while the run is still queued
+
+# Keyed by the Discord message id carrying the controls. Pruned to the most
+# recent entry per channel (see run_claude) so this stays small forever.
+RUN_BY_MESSAGE: dict[int, RunContext] = {}
+
+
+async def _set_post_run_reactions(status: discord.Message):
+    """Swap the in-progress 🛑 for 🔄 retry / 📄 dump-output controls. Clearing
+    the old reaction needs Manage Messages; if the bot doesn't have it, 🛑
+    just stays visible alongside the others (harmless — it's a no-op once the
+    process has already exited)."""
+    try:
+        await status.clear_reaction("🛑")
+    except discord.HTTPException:
+        pass
+    for emoji in ("🔄", "📄"):
+        try:
+            await status.add_reaction(emoji)
+        except discord.HTTPException:
+            pass
+
+# ---------------------------------------------------------------------------
 # Core: run Claude Code and stream progress into a Discord message
 # ---------------------------------------------------------------------------
 async def run_claude(message: discord.Message, st: ChannelState, prompt: str):
@@ -332,6 +369,18 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str):
     cmd = build_command(prompt, st.session_id, st.model)
 
     status = await message.reply(f"🧠 Working in **{st.project}**…")
+
+    ctx = RunContext(channel_id=channel_id, prompt=prompt, trigger_message=message)
+    # Only the latest run for a channel should have live controls — an older
+    # 🛑/🔄/📄 pair would act on state a newer run already moved on from.
+    for mid in [m for m, c in RUN_BY_MESSAGE.items() if c.channel_id == channel_id]:
+        RUN_BY_MESSAGE.pop(mid, None)
+    RUN_BY_MESSAGE[status.id] = ctx
+    try:
+        await status.add_reaction("🛑")
+    except discord.HTTPException:
+        pass
+
     activity: list[str] = []
     final_text = ""
     new_session = st.session_id
@@ -368,6 +417,9 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str):
 
     async with RUN_SEMAPHORE:
         try:
+            if ctx.cancelled:
+                await status.edit(content=f"🛑 cancelled (was queued) · **{st.project}**")
+                return
             spawn_kwargs = {}
             if os.name != "nt":
                 # Own process group so kill() can signal the whole tree, not just
@@ -435,6 +487,7 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str):
             st.runs += 1
             if cost is not None:
                 st.total_cost += cost
+            ctx.final_text = final_text
 
             # Final status line
             footer = f"✅ done · **{st.project}**"
@@ -475,6 +528,7 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str):
             if new_session:
                 st.session_id = new_session
             save_state(channel_id, st)
+            await _set_post_run_reactions(status)
 
 # ---------------------------------------------------------------------------
 # Discord client + command handling
@@ -493,6 +547,9 @@ HELP = (
     f"`{PREFIX}usage` — runs, cost, and rate-limit utilization\n"
     f"`{PREFIX}status` — current project / session / activity\n"
     f"`{PREFIX}cancel` — kill the running task\n"
+    "\n"
+    "**Reactions on a run's status message**\n"
+    "🛑 cancel · 🔄 retry the same prompt · 📄 dump the full output as a file\n"
 )
 
 
@@ -509,6 +566,48 @@ async def on_ready():
     print(f"Logged in as {client.user} (id {client.user.id})")
     print(f"Allowed users: {ALLOWED_USER_IDS or 'NONE — nobody can use the bot!'}")
     print(f"Projects: {list(PROJECTS) or 'NONE — set PROJECTS'}")
+
+
+@client.event
+async def on_reaction_add(reaction: discord.Reaction, user):
+    if user.bot or user.id not in ALLOWED_USER_IDS:
+        return  # ignore the bot's own reactions and anyone off the allowlist
+
+    emoji = str(reaction.emoji)
+    msg = reaction.message
+    channel = msg.channel
+
+    ctx = RUN_BY_MESSAGE.get(msg.id)
+    if ctx is None:
+        return
+
+    if emoji not in ("🛑", "🔄", "📄"):
+        return
+
+    st = state_for(ctx.channel_id)
+
+    if emoji == "🛑":
+        ctx.cancelled = True
+        if st.proc and st.proc.returncode is None:
+            await kill(st.proc)
+        else:
+            await channel.send("🛑 Cancel requested — will stop before starting.")
+
+    elif emoji == "🔄":
+        if st.lock.locked():
+            await channel.send("A task is already running in this channel.")
+        else:
+            async with st.lock:
+                await run_claude(ctx.trigger_message, st, ctx.prompt)
+
+    elif emoji == "📄":
+        text = ctx.final_text or "_(no output captured for this run)_"
+        await channel.send(file=discord.File(io.BytesIO(text.encode("utf-8")), filename="output.md"))
+
+    try:
+        await reaction.remove(user)  # let the same button be pressed again
+    except discord.HTTPException:
+        pass  # needs Manage Messages; harmless if missing
 
 
 @client.event
