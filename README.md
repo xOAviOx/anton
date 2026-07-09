@@ -22,7 +22,8 @@ progress tool calls, file edits, and the final answer back into the channel.
 - Live permission prompts: `!strict on` makes Bash/Edit/Write/etc. wait for a
   ✅/❌ Discord reaction before Claude Code is allowed to run them, instead of
   auto-accepting
-- Multiple projects, switchable per channel
+- Multiple projects, switchable per channel — add new ones at runtime with
+  `!addproject`, or auto-discover git repos under a folder with `!discover`
 - Session continuity so follow-up messages continue the same conversation
 - State (project, session, usage) survives bot restarts
 - A global concurrency cap keeps too many `claude` processes from piling up
@@ -216,6 +217,25 @@ bot passes its own path to `claude` as the MCP server command. It needs no
 extra dependencies (stdlib only) and talks to the bot only through the same
 `anton.db` SQLite file (an `approvals` table), since it runs as `claude`'s own
 subprocess and has no Discord connection of its own.
+
+## Multi-project
+
+Projects configured via `PROJECTS`/env are static — they can't be changed or
+removed at runtime, only added to. `!addproject <name> <path>` registers a new
+one (validated: the path must exist and be a directory) and persists it to
+`anton.db`, so it survives restarts; `!rmproject <name>` removes a
+runtime-added one again (static ones aren't removable this way — edit
+`PROJECTS`/env instead). `!projects` marks runtime-added entries `(added)` so
+you can tell them apart from what's statically configured.
+
+`!discover [path]` scans a directory one level deep for git repos (recognizing
+both a `.git` folder and a `.git` file, so worktrees and submodules count) and
+registers any not already known, using the subdirectory name as the project
+name. Skips anything whose name is already taken, so it won't silently move or
+rename an existing entry. Set `PROJECTS_ROOT` to also run this automatically
+at startup — handy if you keep all your repos under one parent folder and
+want new clones to show up without restarting the bot (just run `!discover`
+again after cloning).
 
 ## Security
 

@@ -284,12 +284,31 @@ safety layer. All of these shell out with `cwd=PROJECTS[st.project]`.
 
 ## Phase 6 — Multi-project & multi-user
 
-### 6.1 Runtime `!addproject <name> <path>` + auto-discovery 🟢
+### 6.1 Runtime `!addproject <name> <path>` + auto-discovery 🟢 ✅ done
 
 - **What:** Add projects without editing env vars; optionally auto-discover git
   repos under a root dir.
 - **How:** Mutate `PROJECTS` at runtime and persist to SQLite. Auto-discovery:
   glob for `.git` dirs under `PROJECTS_ROOT`.
+
+> **Implementation notes (shipped):** `STATIC_PROJECT_NAMES` snapshots
+> `PROJECTS.keys()` right after the env/hardcoded load, before anything
+> runtime-added is merged in — that snapshot is what makes static entries
+> permanently win over a same-named runtime one, and is also how `!addproject`
+> /`!rmproject` refuse to touch a statically-configured name (edit
+> `PROJECTS`/env for those instead). Runtime entries live in a new
+> `extra_projects` SQLite table and get merged into `PROJECTS` once at startup
+> (`load_runtime_projects()`, called from `main()`); `!addproject` and
+> `!discover` additionally update the in-memory dict immediately so they take
+> effect without a restart. `!discover` recognizes both a `.git` directory and
+> a `.git` *file* (the latter is how git worktrees and submodules mark
+> themselves) and skips any subdirectory name already known under any source,
+> so it can never silently rename or move an existing entry. Also added
+> `!rmproject` (not in the original spec) for symmetry — removes a
+> runtime-added project again; there's no equivalent for static ones by
+> design. Verified end-to-end against the real module in a venv with
+> discord.py installed: discovery, add, remove, and the static-wins-over-
+> runtime merge precedence all round-trip correctly through SQLite.
 
 ### 6.2 Fan-out (`!cc-all <prompt>`) 🟡
 

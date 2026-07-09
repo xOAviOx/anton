@@ -15,6 +15,10 @@ Commands (default prefix "!"):
   !new              Start a fresh session for this channel.
   !project [name]   Show the current project, or switch to a configured one.
   !projects         List configured projects.
+  !addproject <n> <path>  Add a project at runtime (persists across restarts).
+  !rmproject <n>    Remove a runtime-added project.
+  !discover [path]  Scan a directory (default PROJECTS_ROOT) for git repos and
+                    add any not already known.
   !model [name]     Show or switch the model (sonnet / opus / haiku / default).
   !strict [on|off]  Toggle live permission prompts: Bash/Edit/etc. wait for a
                     ✅/❌ reaction instead of auto-accepting.
@@ -103,6 +107,7 @@ import asyncio
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -194,6 +199,14 @@ else:
     }
 DEFAULT_PROJECT = os.getenv("DEFAULT_PROJECT") or (next(iter(PROJECTS), None))
 
+# Runtime projects (Phase 6.1): names configured via PROJECTS/env, snapshotted
+# before any !addproject/!discover entries are merged in at startup, so a
+# runtime entry can never silently shadow one you configured intentionally.
+STATIC_PROJECT_NAMES = frozenset(PROJECTS)
+# Optional directory to scan for git repos (`!discover`, and automatically at
+# startup if set) — one level deep, name = subdirectory basename.
+PROJECTS_ROOT = os.getenv("PROJECTS_ROOT")
+
 ALLOWED_USER_IDS = {
     int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x
 }
@@ -266,6 +279,18 @@ def _db() -> sqlite3.Connection:
             message       TEXT,
             created_ts    REAL NOT NULL,
             decided_ts    REAL
+        )
+        """
+    )
+    # Phase 6.1: projects added at runtime (!addproject, !discover), merged into
+    # PROJECTS at startup by load_runtime_projects(). Static PROJECTS/env entries
+    # always take precedence over a same-named row here.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS extra_projects (
+            name      TEXT PRIMARY KEY,
+            path      TEXT NOT NULL,
+            added_ts  REAL NOT NULL
         )
         """
     )
@@ -376,6 +401,73 @@ def run_by_id(channel_id: int, run_id: int) -> Optional[sqlite3.Row]:
         ).fetchone()
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Runtime projects (Phase 6.1): !addproject and PROJECTS_ROOT auto-discovery.
+# ---------------------------------------------------------------------------
+def _load_extra_projects() -> dict[str, str]:
+    conn = _db()
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT name, path FROM extra_projects").fetchall()
+    finally:
+        conn.close()
+    return {r["name"]: r["path"] for r in rows}
+
+
+def _save_extra_project(name: str, path: str) -> None:
+    conn = _db()
+    try:
+        conn.execute(
+            "INSERT INTO extra_projects (name, path, added_ts) VALUES (?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET path = excluded.path, added_ts = excluded.added_ts",
+            (name, path, time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _remove_extra_project(name: str) -> bool:
+    conn = _db()
+    try:
+        cur = conn.execute("DELETE FROM extra_projects WHERE name = ?", (name,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def load_runtime_projects() -> None:
+    """Merge persisted runtime projects (!addproject, !discover) into PROJECTS at
+    startup. Static (env/hardcoded) entries always win over a same-named one
+    here — this only ever fills in names STATIC_PROJECT_NAMES doesn't already
+    have, so a stale/renamed runtime row can never shadow a configured project."""
+    for name, path in _load_extra_projects().items():
+        if name not in STATIC_PROJECT_NAMES:
+            PROJECTS[name] = path
+
+
+def discover_projects(root: str) -> dict[str, str]:
+    """Scan immediate subdirectories of `root` for git repos (a `.git` dir or
+    file — the file form covers worktrees/submodules) and return {name: path}
+    for ones not already known under that name (static or runtime)."""
+    found: dict[str, str] = {}
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return found
+    for entry in entries:
+        if entry.startswith("."):
+            continue
+        path = os.path.join(root, entry)
+        if not os.path.isdir(path) or not os.path.exists(os.path.join(path, ".git")):
+            continue
+        if entry in PROJECTS:
+            continue  # already known under this name — don't silently rename/move it
+        found[entry] = os.path.abspath(path)
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -1246,6 +1338,9 @@ HELP = (
     f"`{PREFIX}new` — start a fresh session\n"
     f"`{PREFIX}project [name]` — show or switch project\n"
     f"`{PREFIX}projects` — list projects\n"
+    f"`{PREFIX}addproject <name> <path>` — add a project at runtime\n"
+    f"`{PREFIX}rmproject <name>` — remove a runtime-added project\n"
+    f"`{PREFIX}discover [path]` — scan for git repos (default `PROJECTS_ROOT`) and add them\n"
     f"`{PREFIX}model [name]` — show or switch model (sonnet / opus / haiku / default)\n"
     f"`{PREFIX}strict [on|off]` — live permission prompts: ask before Bash/Edit/etc.\n"
     f"`{PREFIX}usage` — runs, cost, and rate-limit utilization\n"
@@ -1483,16 +1578,93 @@ async def on_message(message: discord.Message):
     cmd = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
     st = state_for(message.channel.id)
+    global DEFAULT_PROJECT  # mutated by !addproject/!discover when no default is set yet
 
     if cmd == "help":
         await message.reply(HELP)
 
     elif cmd == "projects":
         if not PROJECTS:
-            await message.reply("No projects configured. Set PROJECTS in env or the script.")
+            await message.reply(
+                f"No projects configured. Set PROJECTS in env, or add one with "
+                f"`{PREFIX}addproject <name> <path>`."
+            )
         else:
-            lines = "\n".join(f"• `{n}` → {p}" for n, p in PROJECTS.items())
-            await message.reply(f"**Projects:**\n{lines}")
+            lines = []
+            for n, p in PROJECTS.items():
+                tag = "" if n in STATIC_PROJECT_NAMES else " _(added)_"
+                lines.append(f"• `{n}` → {p}{tag}")
+            await message.reply("**Projects:**\n" + "\n".join(lines))
+
+    elif cmd == "addproject":
+        bits = arg.split(maxsplit=1)
+        if len(bits) != 2:
+            await message.reply(f"Usage: `{PREFIX}addproject <name> <path>`.")
+            return
+        name, raw_path = bits[0], bits[1].strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            await message.reply("Project names may only contain letters, digits, `-`, and `_`.")
+            return
+        if name in STATIC_PROJECT_NAMES:
+            await message.reply(
+                f"`{name}` is already configured via PROJECTS/env — edit that instead of "
+                f"overriding it here."
+            )
+            return
+        abspath = os.path.abspath(os.path.expanduser(raw_path))
+        if not os.path.isdir(abspath):
+            await message.reply(f"`{abspath}` isn't a directory (or doesn't exist).")
+            return
+        _save_extra_project(name, abspath)
+        PROJECTS[name] = abspath
+        if DEFAULT_PROJECT is None:
+            DEFAULT_PROJECT = name
+        await message.reply(
+            f"✅ Added project `{name}` → `{abspath}`. Switch to it with `{PREFIX}project {name}`."
+        )
+
+    elif cmd == "rmproject":
+        name = arg.strip()
+        if not name:
+            await message.reply(f"Usage: `{PREFIX}rmproject <name>`.")
+            return
+        if name in STATIC_PROJECT_NAMES:
+            await message.reply(
+                f"`{name}` is configured via PROJECTS/env — remove it there instead."
+            )
+            return
+        if name not in PROJECTS:
+            await message.reply(f"No such project `{name}`. Try `{PREFIX}projects`.")
+            return
+        _remove_extra_project(name)
+        del PROJECTS[name]
+        await message.reply(
+            f"🗑️ Removed project `{name}`. Channels still pointed at it will need "
+            f"`{PREFIX}project <name>` to switch elsewhere."
+        )
+
+    elif cmd == "discover":
+        root = arg.strip() or PROJECTS_ROOT
+        if not root:
+            await message.reply(
+                f"Usage: `{PREFIX}discover [path]`, or set `PROJECTS_ROOT` to scan by default."
+            )
+            return
+        root = os.path.abspath(os.path.expanduser(root))
+        if not os.path.isdir(root):
+            await message.reply(f"`{root}` isn't a directory.")
+            return
+        found = discover_projects(root)
+        if not found:
+            await message.reply(f"No new git repos found directly under `{root}`.")
+            return
+        for name, path in found.items():
+            _save_extra_project(name, path)
+            PROJECTS[name] = path
+        if DEFAULT_PROJECT is None:
+            DEFAULT_PROJECT = next(iter(found))
+        lines = "\n".join(f"• `{n}` → {p}" for n, p in found.items())
+        await message.reply(f"🔎 Discovered {len(found)} project(s) under `{root}`:\n{lines}")
 
     elif cmd == "project":
         if not arg:
@@ -1866,6 +2038,21 @@ def main():
         sys.exit("DISCORD_TOKEN is not set.")
     if not ALLOWED_USER_IDS:
         sys.exit("ALLOWED_USER_IDS is empty — refusing to start an open bot.")
+
+    # Phase 6.1: merge in projects added at runtime, then auto-discover any new
+    # git repos under PROJECTS_ROOT (if set) before the bot starts taking commands.
+    load_runtime_projects()
+    if PROJECTS_ROOT:
+        found = discover_projects(PROJECTS_ROOT)
+        for name, path in found.items():
+            _save_extra_project(name, path)
+            PROJECTS[name] = path
+        if found:
+            print(f"Auto-discovered {len(found)} project(s) under {PROJECTS_ROOT}: {', '.join(found)}")
+    global DEFAULT_PROJECT
+    if DEFAULT_PROJECT is None and PROJECTS:
+        DEFAULT_PROJECT = next(iter(PROJECTS))
+
     if not PROJECTS:
         print("WARNING: no PROJECTS configured; !cc won't work until you add one.")
     client.run(TOKEN)
