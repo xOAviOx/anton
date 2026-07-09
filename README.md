@@ -14,6 +14,8 @@ progress tool calls, file edits, and the final answer back into the channel.
   reaction before touching your files
 - Git safety net: optional per-session auto-branching, `!diff` to review a run's
   changes, `!revert` to throw them away, and `!commit` / `!pr` to ship them
+- Richer input: attach files/images for Claude to read, and reply to a result to
+  continue that session
 - Multiple projects, switchable per channel
 - Session continuity so follow-up messages continue the same conversation
 - State (project, session, usage) survives bot restarts
@@ -139,6 +141,27 @@ alone and edits in place instead).
 
 Because `!revert` runs `git reset --hard` and `git clean -fd`, it permanently
 discards uncommitted work — that's why it always asks first.
+
+## Richer input
+
+**Attachments.** Drop files or images onto a `!cc` or `!plan` message and the bot
+saves them, then appends their paths to the prompt so Claude Code can read them —
+"implement this mockup", "here's the failing log". You can even send `!cc` with
+no text as long as something is attached. Files are saved under `UPLOAD_DIR`
+(a temp dir by default, so they never pollute your repo or the git safety net);
+attachments over `MAX_ATTACH_MB` (default 25) are skipped and no more than
+`MAX_ATTACH_COUNT` (default 10) are taken.
+
+**Reply to continue.** Reply to any of a run's result messages to send a
+follow-up into *that* run's session, instead of the channel's current one. This
+lets several lines of work coexist in one channel without `!new` — reply to
+thread A, then reply to thread B, and each resumes where it left off. The channel
+then follows whichever thread you replied to last.
+
+Two things to know: a reply that itself starts with `!` (e.g. replying with
+`!diff`) is treated as a normal command, not a continuation — so commands stay
+unambiguous. And the result → session map is in memory only, so after a bot
+restart, replying to an old message just does nothing (use `!cc` to start fresh).
 
 ## Security
 

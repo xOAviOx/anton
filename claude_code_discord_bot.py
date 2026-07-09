@@ -28,6 +28,11 @@ Every run's status message also carries reaction controls: 🛑 cancel (works
 even while a run is still queued behind MAX_CONCURRENT), 🔄 retry the same
 prompt, 📄 dump the full output as a file attachment.
 
+Attach files or images to a !cc/!plan message and their paths are passed to
+Claude Code (e.g. "implement this mockup"). Reply to a run's result message to
+send a follow-up into *that* session, so several lines of work can coexist in
+one channel without !new.
+
 With AUTO_BRANCH=1, each fresh session's edits are isolated on an `anton/<ts>`
 git branch so they're easy to review (!diff) or discard (!revert).
 
@@ -87,6 +92,7 @@ import shutil
 import signal
 import sqlite3
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -132,6 +138,15 @@ MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "2"))
 # `anton/<ts>-<uuid>` branch in the project before Claude touches the tree, so a
 # run's edits are isolated and reviewable (!diff) or throwable-away (!revert).
 AUTO_BRANCH = os.getenv("AUTO_BRANCH", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# Attachments (Phase 3.1): files dropped alongside a !cc/!plan (or a reply-to-
+# continue) are saved under UPLOAD_DIR and their paths appended to the prompt so
+# Claude Code can Read them. Temp dir by default → no repo pollution and no
+# interaction with the git safety net.
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", os.path.join(tempfile.gettempdir(), "anton-uploads"))
+MAX_ATTACH_MB = float(os.getenv("MAX_ATTACH_MB", "25"))
+MAX_ATTACH_COUNT = int(os.getenv("MAX_ATTACH_COUNT", "10"))
+
 
 # Projects: env JSON wins, else edit this dict directly.
 _PROJECTS_ENV = os.getenv("PROJECTS")
@@ -336,6 +351,53 @@ async def claude_text(prompt: str, cwd: str, *, model: Optional[str] = None,
     return text or None
 
 
+# ---------------------------------------------------------------------------
+# Attachments (Phase 3.1): save files dropped in Discord and reference them in
+# the prompt so Claude Code can Read them (images natively, text via Read).
+# ---------------------------------------------------------------------------
+async def save_attachments(message: "discord.Message") -> list[str]:
+    """Save a message's attachments under UPLOAD_DIR and return absolute paths.
+    Skips attachments over MAX_ATTACH_MB and caps the count at MAX_ATTACH_COUNT.
+    Best-effort: an attachment that fails to save is skipped, not fatal."""
+    atts = getattr(message, "attachments", None) or []
+    if not atts:
+        return []
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    dest_dir = tempfile.mkdtemp(prefix="msg-", dir=UPLOAD_DIR)
+    saved: list[str] = []
+    used: set[str] = set()
+    for att in atts[:MAX_ATTACH_COUNT]:
+        size = getattr(att, "size", 0) or 0
+        if size > MAX_ATTACH_MB * 1024 * 1024:
+            continue  # too big — skip (caller notes the skip)
+        # Sanitise: keep only the base name so a crafted filename can't escape.
+        name = os.path.basename(att.filename or "file") or "file"
+        # De-dupe within this message so two same-named files don't clobber.
+        if name in used:
+            root, ext = os.path.splitext(name)
+            i = 1
+            while f"{root}-{i}{ext}" in used:
+                i += 1
+            name = f"{root}-{i}{ext}"
+        dest = os.path.join(dest_dir, name)
+        try:
+            await att.save(dest)
+        except Exception:  # noqa: BLE001 - a bad attachment shouldn't kill the run
+            continue
+        used.add(name)
+        saved.append(dest)
+    return saved
+
+
+def augment_prompt(text: str, paths: list[str]) -> str:
+    """Append saved attachment paths to a prompt so Claude knows to read them."""
+    if not paths:
+        return text
+    listing = "\n".join(f"- {p}" for p in paths)
+    note = "Attached files (saved locally — read them with the Read tool):\n" + listing
+    return f"{text}\n\n{note}" if text.strip() else note
+
+
 def summarize_tool(name: str, inp: dict) -> str:
     """One-line, human-readable summary of a tool_use block."""
     def short(s, n=90):
@@ -500,11 +562,30 @@ class RevertContext:
     ref: str      # pre-run HEAD to reset back to
     project: str
 
+@dataclass
+class ResultContext:
+    channel_id: int
+    session_id: str
+    project: str
+
 # Keyed by the Discord message id carrying the controls. Pruned to the most
 # recent entry per channel (see run_claude) so these stay small forever.
 RUN_BY_MESSAGE: dict[int, RunContext] = {}
 PLAN_BY_MESSAGE: dict[int, PlanContext] = {}
 REVERT_BY_MESSAGE: dict[int, "RevertContext"] = {}
+# Maps a posted result message → the session that produced it, so replying to it
+# continues that session (Phase 3.2). NOT pruned per channel — replying to an old
+# result is the point — just bounded so it can't grow forever. In-memory only:
+# replies stop resolving after a restart.
+RESULT_BY_MESSAGE: dict[int, "ResultContext"] = {}
+RESULT_MAP_MAX = 500
+
+
+def _register_result(message_id: int, ctx: "ResultContext") -> None:
+    """Record a result→session mapping, evicting the oldest once over the cap."""
+    RESULT_BY_MESSAGE[message_id] = ctx
+    while len(RESULT_BY_MESSAGE) > RESULT_MAP_MAX:
+        RESULT_BY_MESSAGE.pop(next(iter(RESULT_BY_MESSAGE)))
 
 
 async def _set_post_run_reactions(status: discord.Message):
@@ -676,12 +757,22 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str, *,
 
             failed = is_error or proc.returncode not in (0, None)
 
+            async def send_result(text: str):
+                """Post a result chunk and map it to this session so a reply to it
+                continues the conversation (Phase 3.2)."""
+                m = await message.channel.send(text)
+                if new_session:
+                    _register_result(m.id, ResultContext(
+                        channel_id=channel_id, session_id=new_session, project=st.project,
+                    ))
+                return m
+
             if failed:
                 footer = f"⚠️ finished with issues · **{st.project}** (exit {proc.returncode})"
                 await status.edit(content=footer[:MAX_MSG])
                 pieces = chunk(final_text) or ["_(no textual output)_"]
                 for p in pieces:
-                    await message.channel.send(p)
+                    await send_result(p)
                 if stderr.strip():
                     for p in chunk("stderr:\n" + stderr):
                         await message.channel.send(f"```\n{p}\n```")
@@ -717,7 +808,7 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str, *,
                 await status.edit(content=footer[:MAX_MSG])
                 pieces = chunk(final_text) or ["_(no textual output)_"]
                 for p in pieces:
-                    await message.channel.send(p)
+                    await send_result(p)
 
         except asyncio.TimeoutError:
             await kill(st.proc)
@@ -773,6 +864,10 @@ HELP = (
     "\n"
     "**Reactions on a run's status message**\n"
     "🛑 cancel · 🔄 retry the same prompt · 📄 dump the full output as a file\n"
+    "\n"
+    "**Richer input**\n"
+    "Attach files/images to `!cc` or `!plan` and Claude can read them. "
+    "Reply to a result message to continue *that* session.\n"
 )
 
 
@@ -899,7 +994,43 @@ async def on_reaction_add(reaction: discord.Reaction, user):
 
 @client.event
 async def on_message(message: discord.Message):
-    if message.author.bot or not message.content.startswith(PREFIX):
+    if message.author.bot:
+        return
+
+    # Reply-to-continue (Phase 3.2): a reply to one of our result messages that
+    # ISN'T itself a command continues that message's session. Replies that start
+    # with the prefix (e.g. replying with `!diff`) fall through to normal command
+    # handling, so commands stay unambiguous.
+    ref_id = getattr(getattr(message, "reference", None), "message_id", None)
+    if (ref_id is not None and ref_id in RESULT_BY_MESSAGE
+            and not message.content.startswith(PREFIX)):
+        if not authorized(message):
+            return
+        rctx = RESULT_BY_MESSAGE[ref_id]
+        st = state_for(message.channel.id)
+        if rctx.project not in PROJECTS:
+            await message.reply(
+                f"That thread's project (`{rctx.project}`) is no longer configured."
+            )
+            return
+        if st.lock.locked():
+            await message.reply(
+                f"A task is already running in this channel. `{PREFIX}cancel` to stop it, "
+                "or use another channel."
+            )
+            return
+        files = await save_attachments(message)
+        prompt = augment_prompt(message.content.strip(), files)
+        if not prompt.strip():
+            return  # empty reply with no attachments — nothing to do
+        # Resume the replied-to thread. Sessions are dir-scoped, so align project.
+        st.project = rctx.project
+        st.session_id = rctx.session_id
+        async with st.lock:
+            await run_claude(message, st, prompt)
+        return
+
+    if not message.content.startswith(PREFIX):
         return
     if not authorized(message):
         return  # silently ignore non-allowlisted users/channels
@@ -989,11 +1120,12 @@ async def on_message(message: discord.Message):
             await message.reply("Nothing is running.")
 
     elif cmd == "cc":
-        if not arg:
-            await message.reply(f"Usage: `{PREFIX}cc <prompt>`")
-            return
         if not st.project or st.project not in PROJECTS:
             await message.reply(f"No valid project set. Use `{PREFIX}project <name>`.")
+            return
+        files = await save_attachments(message)
+        if not arg and not files:
+            await message.reply(f"Usage: `{PREFIX}cc <prompt>` (or attach a file).")
             return
         if st.lock.locked():
             await message.reply(
@@ -1002,14 +1134,15 @@ async def on_message(message: discord.Message):
             )
             return
         async with st.lock:
-            await run_claude(message, st, arg)
+            await run_claude(message, st, augment_prompt(arg, files))
 
     elif cmd == "plan":
-        if not arg:
-            await message.reply(f"Usage: `{PREFIX}plan <prompt>`")
-            return
         if not st.project or st.project not in PROJECTS:
             await message.reply(f"No valid project set. Use `{PREFIX}project <name>`.")
+            return
+        files = await save_attachments(message)
+        if not arg and not files:
+            await message.reply(f"Usage: `{PREFIX}plan <prompt>` (or attach a file).")
             return
         if st.lock.locked():
             await message.reply(
@@ -1018,7 +1151,7 @@ async def on_message(message: discord.Message):
             )
             return
         async with st.lock:
-            await run_claude(message, st, arg, plan_mode=True)
+            await run_claude(message, st, augment_prompt(arg, files), plan_mode=True)
 
     elif cmd == "diff":
         if not st.project or st.project not in PROJECTS:

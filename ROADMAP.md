@@ -141,7 +141,17 @@ safety layer. All of these shell out with `cwd=PROJECTS[st.project]`.
 
 ## Phase 3 — Better input
 
-### 3.1 Attachments as input 🟢
+> **Implementation notes (3.1–3.2 shipped):** attachments save to a temp dir
+> (`UPLOAD_DIR`, default `<tmp>/anton-uploads`), **not** the project dir, so they
+> don't pollute the repo or get swept up by the git safety net; filenames are
+> `basename`-sanitised and de-duped, oversized (`MAX_ATTACH_MB`) skipped, count
+> capped (`MAX_ATTACH_COUNT`). `!cc`/`!plan` now run with attachments and no
+> text. Reply-to-continue registers every posted result message in a bounded
+> in-memory map (`RESULT_BY_MESSAGE`, evicts oldest past 500); a reply that
+> starts with `!` is still treated as a command, not a continuation; the map is
+> not persisted, so replies stop resolving after a restart.
+
+### 3.1 Attachments as input 🟢 ✅ done
 
 - **What:** Drop an image or file into Discord; the bot saves it into the project
   dir (or a temp path) so you can say "implement this mockup" or "here's the
@@ -150,7 +160,7 @@ safety layer. All of these shell out with `cwd=PROJECTS[st.project]`.
   attachment.save(dest)` into the project dir, and append the saved paths to the
   prompt text passed to `run_claude`.
 
-### 3.2 Reply-to-continue 🟢
+### 3.2 Reply-to-continue 🟢 ✅ done
 
 - **What:** Reply to a run's result message to send a follow-up into **that**
   session, so multiple lines of work coexist in one channel without `!new`.
