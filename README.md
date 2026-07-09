@@ -16,6 +16,9 @@ progress tool calls, file edits, and the final answer back into the channel.
   changes, `!revert` to throw them away, and `!commit` / `!pr` to ship them
 - Richer input: attach files/images for Claude to read, and reply to a result to
   continue that session
+- History & cost: every run is logged (`!history`, `!resume <id>`), spend is
+  tracked (`!cost`), an optional `DAILY_BUDGET_USD` caps it, and long runs can
+  `@`-mention you when they finish
 - Multiple projects, switchable per channel
 - Session continuity so follow-up messages continue the same conversation
 - State (project, session, usage) survives bot restarts
@@ -162,6 +165,27 @@ Two things to know: a reply that itself starts with `!` (e.g. replying with
 `!diff`) is treated as a normal command, not a continuation — so commands stay
 unambiguous. And the result → session map is in memory only, so after a bot
 restart, replying to an old message just does nothing (use `!cc` to start fresh).
+
+## History, cost & notifications
+
+Every run is logged to the SQLite db (prompt, session, cost, duration, files
+changed, outcome), and Claude's prose now streams into the live status message
+as it arrives — not just tool calls.
+
+| Command | Effect |
+| --- | --- |
+| `!history [n]` | List the last `n` runs in this channel (default 10, max 25) with cost, files changed, outcome, and a `#id` |
+| `!resume <id>` | Resume the session from run `#id`; the next `!cc` continues it |
+| `!cost` | Spend today and this week (across all channels), plus remaining daily budget |
+
+Set `DAILY_BUDGET_USD` to cap total spend per local day — once reached, `!cc`,
+`!plan`, and reply-continuations are refused until midnight (0, the default,
+disables the cap). `!resume` re-runs a past thread; because history is on disk,
+it survives restarts (unlike reply-to-continue's in-memory map).
+
+Set `NOTIFY_AFTER_SECONDS` (default 120; 0 disables) so any run that takes at
+least that long `@`-mentions you in the channel when it finishes — fire a task
+from your phone, walk away, and get pinged when it's done.
 
 ## Security
 

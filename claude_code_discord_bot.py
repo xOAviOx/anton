@@ -15,6 +15,11 @@ Commands (default prefix "!"):
   !new              Start a fresh session for this channel.
   !project [name]   Show the current project, or switch to a configured one.
   !projects         List configured projects.
+  !model [name]     Show or switch the model (sonnet / opus / haiku / default).
+  !usage            Runs, cost, and rate-limit utilization for this channel.
+  !history [n]      List recent runs in this channel (default 10).
+  !resume <id>      Resume the session from a past run (see !history).
+  !cost             Spend today / this week, and remaining daily budget.
   !diff             Show what the current session changed (stat + full patch).
   !revert / !undo   Throw away the last run's changes (asks to confirm first).
   !commit [msg]     Stage all changes and commit; Claude writes the message if
@@ -35,6 +40,10 @@ one channel without !new.
 
 With AUTO_BRANCH=1, each fresh session's edits are isolated on an `anton/<ts>`
 git branch so they're easy to review (!diff) or discard (!revert).
+
+Every run is logged for !history / !resume and cost tracking. Set
+DAILY_BUDGET_USD to cap daily spend and NOTIFY_AFTER_SECONDS to be @-mentioned
+when a long run finishes.
 
 Each Discord channel keeps its own project + session, so you can run several
 projects in parallel from different channels.
@@ -147,6 +156,12 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR", os.path.join(tempfile.gettempdir(), "anton-
 MAX_ATTACH_MB = float(os.getenv("MAX_ATTACH_MB", "25"))
 MAX_ATTACH_COUNT = int(os.getenv("MAX_ATTACH_COUNT", "10"))
 
+# Cost & notifications (Phase 4). DAILY_BUDGET_USD caps total spend across all
+# channels per local day (0 = no cap). NOTIFY_AFTER_SECONDS @-mentions you when a
+# run that took at least this long finishes (0 = never).
+DAILY_BUDGET_USD = float(os.getenv("DAILY_BUDGET_USD", "0"))
+NOTIFY_AFTER_SECONDS = int(os.getenv("NOTIFY_AFTER_SECONDS", "120"))
+
 
 # Projects: env JSON wins, else edit this dict directly.
 _PROJECTS_ENV = os.getenv("PROJECTS")
@@ -194,6 +209,23 @@ def _db() -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE channel_state ADD COLUMN {col}")
         except sqlite3.OperationalError:
             pass  # duplicate column — already migrated
+    # Phase 4: one row per run, for !history / !resume and daily-budget sums.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runs (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id     INTEGER NOT NULL,
+            project        TEXT,
+            session_id     TEXT,
+            prompt         TEXT,
+            cost           REAL,
+            duration       REAL,
+            files_changed  INTEGER,
+            outcome        TEXT,
+            ts             REAL NOT NULL
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -238,6 +270,66 @@ def save_state(channel_id: int, st: "ChannelState") -> None:
              st.run_branch, st.branched_for_session, st.pre_run_ref),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def log_run(*, channel_id: int, project: Optional[str], session_id: Optional[str],
+            prompt: str, cost: Optional[float], duration: Optional[float],
+            files_changed: Optional[int], outcome: str, ts: float) -> None:
+    """Append one row to the runs table (Phase 4.1). Best-effort — a logging
+    failure must never propagate into the run's own error handling."""
+    try:
+        conn = _db()
+        try:
+            conn.execute(
+                "INSERT INTO runs (channel_id, project, session_id, prompt, cost, "
+                "duration, files_changed, outcome, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (channel_id, project, session_id, prompt, cost, duration,
+                 files_changed, outcome, ts),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 - never let history logging break a run
+        pass
+
+
+def spend_since(epoch: float) -> float:
+    """Total cost across all channels for runs at or after `epoch` (Phase 4.2)."""
+    conn = _db()
+    try:
+        return float(conn.execute(
+            "SELECT COALESCE(SUM(cost), 0) FROM runs WHERE ts >= ?", (epoch,)
+        ).fetchone()[0])
+    finally:
+        conn.close()
+
+
+def recent_runs(channel_id: int, n: int) -> list[sqlite3.Row]:
+    """The most recent `n` runs for a channel, newest first (Phase 4.1)."""
+    conn = _db()
+    try:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT id, project, session_id, prompt, cost, duration, files_changed, "
+            "outcome, ts FROM runs WHERE channel_id = ? ORDER BY id DESC LIMIT ?",
+            (channel_id, n),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def run_by_id(channel_id: int, run_id: int) -> Optional[sqlite3.Row]:
+    """One run by id, scoped to the channel (so you can't resume another's)."""
+    conn = _db()
+    try:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT id, project, session_id, prompt FROM runs "
+            "WHERE id = ? AND channel_id = ?",
+            (run_id, channel_id),
+        ).fetchone()
     finally:
         conn.close()
 
@@ -398,11 +490,16 @@ def augment_prompt(text: str, paths: list[str]) -> str:
     return f"{text}\n\n{note}" if text.strip() else note
 
 
+def preview(text: str, n: int = 200) -> str:
+    """Collapse whitespace and truncate to ~n chars with an ellipsis."""
+    s = " ".join(str(text).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
 def summarize_tool(name: str, inp: dict) -> str:
     """One-line, human-readable summary of a tool_use block."""
     def short(s, n=90):
-        s = " ".join(str(s).split())
-        return s if len(s) <= n else s[: n - 1] + "…"
+        return preview(s, n)
 
     icons = {"Bash": "🖥️", "Read": "📖", "Edit": "✏️", "Write": "📝",
              "Glob": "🔎", "Grep": "🔎", "TodoWrite": "🗒️", "WebFetch": "🌐",
@@ -490,6 +587,45 @@ async def _git(cwd: str, *args: str) -> tuple[int, str, str]:
 async def _is_git_repo(cwd: str) -> bool:
     code, out, _ = await _git(cwd, "rev-parse", "--is-inside-work-tree")
     return code == 0 and out == "true"
+
+
+async def _count_changed(project_path: str, ref: Optional[str]) -> Optional[int]:
+    """Number of files changed since `ref` (for the runs log). None if we can't
+    tell (no ref, not a git repo)."""
+    if not ref or not await _is_git_repo(project_path):
+        return None
+    code, out, _ = await _git(project_path, "diff", "--name-only", ref)
+    if code != 0:
+        return None
+    return len([ln for ln in out.splitlines() if ln.strip()])
+
+
+# ---------------------------------------------------------------------------
+# Cost & budget (Phase 4.2). Days/weeks are local time; sums come from the runs
+# table so they survive restarts and span every channel (one global budget knob).
+# ---------------------------------------------------------------------------
+def _day_start_epoch() -> float:
+    t = time.localtime()
+    return time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, -1))
+
+
+def _week_start_epoch() -> float:
+    # Monday 00:00 of the current local week.
+    t = time.localtime()
+    monday = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, -1))
+    return monday - t.tm_wday * 86400
+
+
+def budget_blocked() -> Optional[str]:
+    """A user-facing message if today's spend has hit DAILY_BUDGET_USD, else None."""
+    if DAILY_BUDGET_USD <= 0:
+        return None
+    today = spend_since(_day_start_epoch())
+    if today >= DAILY_BUDGET_USD:
+        return (f"🚫 Daily budget of ${DAILY_BUDGET_USD:.2f} reached "
+                f"(spent ${today:.4f} today). Resets at local midnight, or raise "
+                "`DAILY_BUDGET_USD`.")
+    return None
 
 
 async def _ensure_branch(st: ChannelState, project_path: str) -> Optional[str]:
@@ -638,6 +774,9 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str, *,
     cost = None
     is_error = False
     last_edit = 0.0
+    run_start = time.monotonic()  # for duration (Phase 4.1) / notify (4.4)
+    spawned = False               # did the subprocess actually start?
+    outcome = "ok"                # ok | error | timeout | cancelled | crash | not-found
 
     async def render():
         nonlocal last_edit
@@ -698,6 +837,7 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str, *,
                 **spawn_kwargs,
             )
             st.proc = proc
+            spawned = True
 
             stderr_task = asyncio.create_task(proc.stderr.read())
             tick_task = asyncio.create_task(ticker())
@@ -724,9 +864,15 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str, *,
 
                     elif etype == "assistant":
                         for block in evt.get("message", {}).get("content", []):
-                            if block.get("type") == "tool_use":
+                            btype = block.get("type")
+                            if btype == "tool_use":
                                 activity.append(summarize_tool(block.get("name", "?"),
                                                                block.get("input", {})))
+                            elif btype == "text":
+                                # Stream Claude's prose live, not just tool calls (4.3).
+                                txt = block.get("text", "").strip()
+                                if txt:
+                                    activity.append(f"💬 {preview(txt)}")
 
                     elif etype == "result":
                         final_text = evt.get("result") or final_text
@@ -756,6 +902,8 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str, *,
             ctx.final_text = final_text
 
             failed = is_error or proc.returncode not in (0, None)
+            if failed:
+                outcome = "error"
 
             async def send_result(text: str):
                 """Post a result chunk and map it to this session so a reply to it
@@ -811,18 +959,22 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str, *,
                     await send_result(p)
 
         except asyncio.TimeoutError:
+            outcome = "timeout"
             await kill(st.proc)
             await status.edit(content=f"⏱️ timed out after {RUN_TIMEOUT}s · **{st.project}**")
         except FileNotFoundError:
+            outcome = "not-found"
             await status.edit(
                 content="❌ `claude` not found. Install Claude Code and make sure it's on PATH "
                         "(or set CLAUDE_BIN to the full path)."
             )
         except asyncio.CancelledError:
+            outcome = "cancelled"
             await kill(st.proc)
             await status.edit(content=f"🛑 cancelled · **{st.project}**")
             raise
         except Exception as e:  # noqa: BLE001 - surface anything else to the user
+            outcome = "crash"
             await kill(st.proc)
             await status.edit(content=f"❌ error: {type(e).__name__}: {str(e)[:400]}")
         finally:
@@ -834,6 +986,33 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str, *,
             if new_session:
                 st.session_id = new_session
             save_state(channel_id, st)
+            # Log the run for !history and budget sums (Phase 4.1). Only once the
+            # process actually started — a queued run cancelled before spawn, or a
+            # missing binary, isn't a "run". Covers every outcome, not just success.
+            if spawned:
+                duration = time.monotonic() - run_start
+                try:
+                    files_changed = await _count_changed(project_path, st.pre_run_ref)
+                except Exception:  # noqa: BLE001
+                    files_changed = None
+                log_run(
+                    channel_id=channel_id, project=st.project, session_id=new_session,
+                    prompt=prompt[:500], cost=cost, duration=duration,
+                    files_changed=files_changed, outcome=outcome, ts=time.time(),
+                )
+                # @-mention if the run was long enough that you may have wandered off.
+                if (NOTIFY_AFTER_SECONDS > 0 and duration >= NOTIFY_AFTER_SECONDS
+                        and outcome != "cancelled"):
+                    ok = outcome == "ok"
+                    emoji = "✅" if ok else "⚠️"
+                    word = "finished" if ok else f"ended ({outcome})"
+                    try:
+                        await message.channel.send(
+                            f"{message.author.mention} {emoji} Run {word} in "
+                            f"**{st.project}** · {int(duration)}s"
+                        )
+                    except discord.HTTPException:
+                        pass
             await _set_post_run_reactions(status)
 
 # ---------------------------------------------------------------------------
@@ -852,6 +1031,9 @@ HELP = (
     f"`{PREFIX}projects` — list projects\n"
     f"`{PREFIX}model [name]` — show or switch model (sonnet / opus / haiku / default)\n"
     f"`{PREFIX}usage` — runs, cost, and rate-limit utilization\n"
+    f"`{PREFIX}history [n]` — recent runs in this channel; resume any of them\n"
+    f"`{PREFIX}resume <id>` — resume the session from a past run\n"
+    f"`{PREFIX}cost` — spend today / this week (and budget, if set)\n"
     f"`{PREFIX}status` — current project / session / activity\n"
     f"`{PREFIX}cancel` — kill the running task\n"
     "\n"
@@ -1023,6 +1205,9 @@ async def on_message(message: discord.Message):
         prompt = augment_prompt(message.content.strip(), files)
         if not prompt.strip():
             return  # empty reply with no attachments — nothing to do
+        if (blocked := budget_blocked()):
+            await message.reply(blocked)
+            return
         # Resume the replied-to thread. Sessions are dir-scoped, so align project.
         st.project = rctx.project
         st.session_id = rctx.session_id
@@ -1097,6 +1282,74 @@ async def on_message(message: discord.Message):
             lines.append("_Rate-limit info appears after your first `!cc` run._")
         await message.reply("\n".join(lines))
 
+    elif cmd == "cost":
+        today = spend_since(_day_start_epoch())
+        week = spend_since(_week_start_epoch())
+        lines = [
+            "**Spend** (all channels)",
+            f"Today: **${today:.4f}**",
+            f"This week: **${week:.4f}**",
+        ]
+        if DAILY_BUDGET_USD > 0:
+            left = max(0.0, DAILY_BUDGET_USD - today)
+            lines.append(
+                f"Daily budget: **${today:.4f} / ${DAILY_BUDGET_USD:.2f}** "
+                f"(${left:.4f} left)"
+            )
+        else:
+            lines.append("_No daily budget set (`DAILY_BUDGET_USD`)._")
+        await message.reply("\n".join(lines))
+
+    elif cmd == "history":
+        try:
+            n = max(1, min(25, int(arg))) if arg else 10
+        except ValueError:
+            n = 10
+        rows = recent_runs(message.channel.id, n)
+        if not rows:
+            await message.reply("No runs recorded yet for this channel.")
+            return
+        lines = [f"**Last {len(rows)} run(s)**"]
+        for r in rows:
+            mark = {"ok": "✅", "error": "⚠️", "timeout": "⏱️",
+                    "cancelled": "🛑", "crash": "❌", "not-found": "❓"}.get(r["outcome"], "•")
+            bits = [f"`#{r['id']}`", mark, f"<t:{int(r['ts'])}:R>", f"**{r['project'] or '?'}**"]
+            if r["cost"] is not None:
+                bits.append(f"${r['cost']:.4f}")
+            if r["files_changed"] is not None:
+                bits.append(f"{r['files_changed']}f")
+            lines.append(" · ".join(bits) + f" — {preview(r['prompt'] or '', 80)}")
+        lines.append(f"_Resume any with `{PREFIX}resume <id>`._")
+        for c in chunk("\n".join(lines)):
+            await message.channel.send(c)
+
+    elif cmd == "resume":
+        if not arg.isdigit():
+            await message.reply(f"Usage: `{PREFIX}resume <id>` (see `{PREFIX}history`).")
+            return
+        row = run_by_id(message.channel.id, int(arg))
+        if row is None:
+            await message.reply(f"No run `#{arg}` in this channel. Try `{PREFIX}history`.")
+            return
+        if not row["session_id"]:
+            await message.reply(f"Run `#{arg}` has no session to resume.")
+            return
+        if row["project"] and row["project"] not in PROJECTS:
+            await message.reply(
+                f"Run `#{arg}`'s project (`{row['project']}`) is no longer configured."
+            )
+            return
+        if row["project"]:
+            st.project = row["project"]
+        st.session_id = row["session_id"]
+        # Fresh branch state so the resumed session re-branches cleanly (like !new).
+        st.run_branch = st.branched_for_session = st.pre_run_ref = None
+        save_state(message.channel.id, st)
+        await message.reply(
+            f"Resumed session from run `#{arg}` in **{st.project or 'none'}**. "
+            f"Next `{PREFIX}cc` continues it."
+        )
+
     elif cmd == "new":
         st.session_id = None
         # New session → next run branches fresh instead of reusing the old one.
@@ -1133,6 +1386,9 @@ async def on_message(message: discord.Message):
                 "or use another channel."
             )
             return
+        if (blocked := budget_blocked()):
+            await message.reply(blocked)
+            return
         async with st.lock:
             await run_claude(message, st, augment_prompt(arg, files))
 
@@ -1149,6 +1405,9 @@ async def on_message(message: discord.Message):
                 f"A task is already running in this channel. `{PREFIX}cancel` to stop it, "
                 "or use another channel."
             )
+            return
+        if (blocked := budget_blocked()):
+            await message.reply(blocked)
             return
         async with st.lock:
             await run_claude(message, st, augment_prompt(arg, files), plan_mode=True)

@@ -172,7 +172,25 @@ safety layer. All of these shell out with `cwd=PROJECTS[st.project]`.
 
 ## Phase 4 — Observability, cost & history
 
-### 4.1 Persistent history + `!history` 🟢
+> **Implementation notes (4.1–4.4 shipped):** a `runs` table (Phase 0 db) gets
+> one row per *spawned* run — a queued run cancelled before `claude` starts, or
+> a missing binary, is intentionally not logged, since it never really ran.
+> `outcome` is one of `ok / error / timeout / cancelled / crash / not-found`.
+> `!history` reads it back per-channel; `!resume <id>` sets `st.session_id`
+> (and clears the branch-tracking fields so the resumed session re-branches
+> cleanly, like `!new`) but refuses if the run's project is no longer
+> configured. `DAILY_BUDGET_USD` sums `cost` across **all channels** since
+> local midnight (`spend_since` / `_day_start_epoch`) and is checked in `!cc`,
+> `!plan`, and reply-continuations — not just `!cc`. `!cost` also reports the
+> week-to-date sum (`_week_start_epoch`, Monday-anchored). Assistant `text`
+> blocks now stream into `activity` alongside tool-use lines (prefixed `💬`,
+> truncated via a shared `preview()` helper) instead of only surfacing in the
+> final message. `NOTIFY_AFTER_SECONDS` mentions (not DMs — simpler, and the
+> channel already has context) the author in-channel once a *spawned* run's
+> wall time meets the threshold, skipping cancelled runs since those are
+> already a deliberate user action.
+
+### 4.1 Persistent history + `!history` 🟢 ✅ done
 
 - **What:** Log each run (prompt, session id, cost, duration, files changed);
   `!history` lists recent runs and lets you resume any of them.
@@ -180,14 +198,14 @@ safety layer. All of these shell out with `cwd=PROJECTS[st.project]`.
   `run_claude`. `!history` reads the last N; `!resume <id>` sets
   `st.session_id`.
 
-### 4.2 Budget caps 🟢
+### 4.2 Budget caps 🟢 ✅ done
 
 - **What:** `DAILY_BUDGET_USD` — refuse new runs once the cap is hit; `!cost` shows
   today / this-week spend.
 - **How:** Sum `total_cost_usd` from the `runs` table for the current day before
   admitting a run in the `cc` handler.
 
-### 4.3 Stream assistant text live 🟡
+### 4.3 Stream assistant text live 🟢 ✅ done
 
 - **What:** Show Claude's prose as it arrives, not just tool calls, so long answers
   feel alive.
@@ -195,7 +213,7 @@ safety layer. All of these shell out with `cwd=PROJECTS[st.project]`.
   truncated preview to `activity` (or a second streamed message) instead of only
   buffering `final_text`.
 
-### 4.4 DM / mention on completion 🟢
+### 4.4 DM / mention on completion 🟢 ✅ done
 
 - **What:** Ping or DM you when a long run finishes or fails, so you can
   fire-and-forget.
@@ -250,13 +268,14 @@ safety layer. All of these shell out with `cwd=PROJECTS[st.project]`.
 
 ## Suggested build order
 
-1. **Phase 0** (foundation: persistence, process-group kill, semaphore).
-2. **Phase 2.1–2.3** (auto-branch, `!diff`, `!revert`) — the safety net.
-3. **Phase 1.1** (reaction controls) + **Phase 1.2** (plan→approve→execute).
-4. **Phase 3** (attachments, reply-to-continue).
-5. **Phase 4** (history, budgets, notifications).
-6. **Phase 1.3** (live permission MCP) — powerful, standalone.
-7. **Phase 5–6** (automation, multi-project) as needed.
+1. **Phase 0** (foundation: persistence, process-group kill, semaphore). ✅ done
+2. **Phase 2.1–2.3** (auto-branch, `!diff`, `!revert`) — the safety net. ✅ done
+3. **Phase 1.1** (reaction controls) + **Phase 1.2** (plan→approve→execute). ✅ done
+4. **Phase 2.4** (`!commit`, `!pr`). ✅ done
+5. **Phase 3** (attachments, reply-to-continue). ✅ done
+6. **Phase 4** (history, budgets, notifications). ✅ done
+7. **Phase 1.3** (live permission MCP) — powerful, standalone.
+8. **Phase 5–6** (automation, multi-project) as needed.
 
 ## Cross-cutting
 
