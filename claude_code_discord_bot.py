@@ -69,6 +69,7 @@ import asyncio
 import json
 import os
 import shutil
+import signal
 import sqlite3
 import sys
 import time
@@ -290,15 +291,31 @@ def chunk(text: str, size: int = MAX_MSG) -> list[str]:
 
 
 async def kill(proc: Optional[asyncio.subprocess.Process]):
-    if proc and proc.returncode is None:
-        try:
-            proc.terminate()
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except (asyncio.TimeoutError, ProcessLookupError):
+    """Terminate a run, including any children it spawned (bash, subagents, MCP
+    servers). `claude` is launched in its own process group (see run_claude), so
+    we signal the whole group rather than just the parent PID — otherwise
+    `!cancel` and timeouts can leave orphaned children running."""
+    if not proc or proc.returncode is not None:
+        return
+
+    def _signal(sig: int):
+        if os.name != "nt":
             try:
-                proc.kill()
+                os.killpg(os.getpgid(proc.pid), sig)
+                return
             except ProcessLookupError:
-                pass
+                return
+        # Windows has no process groups here; fall back to the direct handle.
+        try:
+            proc.terminate() if sig == signal.SIGTERM else proc.kill()
+        except ProcessLookupError:
+            pass
+
+    try:
+        _signal(signal.SIGTERM)
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        _signal(signal.SIGKILL)
 
 # ---------------------------------------------------------------------------
 # Core: run Claude Code and stream progress into a Discord message
@@ -336,10 +353,16 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str):
     tick_task: Optional[asyncio.Task] = None
 
     try:
+        spawn_kwargs = {}
+        if os.name != "nt":
+            # Own process group so kill() can signal the whole tree, not just
+            # the `claude` parent (it spawns bash/subagents/MCP children).
+            spawn_kwargs["start_new_session"] = True
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=project_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **spawn_kwargs,
         )
         st.proc = proc
 
