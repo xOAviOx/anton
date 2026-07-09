@@ -298,7 +298,7 @@ safety layer. All of these shell out with `cwd=PROJECTS[st.project]`.
 > connection was available to test against) — including the project-missing
 > and lock-already-held skip paths.
 
-### 5.2 GitHub webhook triggers 🔴
+### 5.2 GitHub webhook triggers 🔴 ✅ done
 
 - **What:** Issue labeled `claude` → auto-run Claude on it and report back; CI
   failure → auto-attempt a fix.
@@ -306,6 +306,36 @@ safety layer. All of these shell out with `cwd=PROJECTS[st.project]`.
   validate the GitHub HMAC signature; map events to a project + prompt and dispatch
   into a designated channel. Turns Anton from a remote control into an autonomous
   teammate.
+
+> **Implementation notes (shipped):** `aiohttp` is an optional import (same
+> try/except pattern as `python-dotenv`), so it's only a hard requirement if
+> `WEBHOOK_PORT` is actually set — everyone else's install is unaffected.
+> Running an aiohttp server *and* the Discord client in the same process
+> means `client.run(TOKEN)`'s own internal `asyncio.run()` wrapper can't be
+> used as-is; `main()` branches to a custom `_amain()` that starts the
+> `aiohttp.web.AppRunner`/`TCPSite` first and then runs `client.start(TOKEN)`
+> in the same event loop when `WEBHOOK_PORT` is set, falling back to the
+> normal `client.run(TOKEN)` otherwise. `WEBHOOK_SECRET` is mandatory
+> whenever `WEBHOOK_PORT` is set — the bot refuses to start without it
+> rather than silently exposing an unauthenticated endpoint that lets
+> anyone who finds the URL trigger a run.
+>
+> `_prompt_for_github_event()` (the event → prompt mapping) is deliberately
+> factored out from the HTTP handler so it's testable without spinning up
+> aiohttp at all — verified directly against simulated GitHub payloads for
+> `issues`/labeled, `workflow_run`/`check_suite` completed-with-failure, and
+> non-matching cases (wrong label, success conclusion, unrelated event).
+> `_verify_github_signature()`'s constant-time HMAC check was verified
+> against a real computed signature, a tampered body, and a malformed
+> header. The full HTTP layer (signature enforcement, repo routing via
+> `WEBHOOK_ROUTES`, and actual dispatch) was verified end-to-end with
+> `aiohttp.test_utils.TestClient` — no live GitHub delivery available to
+> test against in this environment, but the wire format is exactly what
+> GitHub's webhook docs specify, and every layer up to the dispatch call
+> itself is now exercised. Built on `_run_unattended()`, the same
+> one-shot-no-session-no-reactions dispatcher `!schedule` uses (see 5.1) —
+> webhook triggers have even less of a "someone's watching" context than a
+> schedule does, so the same posture applies for the same reason.
 
 ---
 
@@ -429,7 +459,10 @@ safety layer. All of these shell out with `cwd=PROJECTS[st.project]`.
 5. **Phase 3** (attachments, reply-to-continue). ✅ done
 6. **Phase 4** (history, budgets, notifications). ✅ done
 7. **Phase 1.3** (live permission MCP) — powerful, standalone. ✅ done
-8. **Phase 5–6** (automation, multi-project) as needed.
+8. **Phase 5–6** (automation, multi-project) as needed. ✅ done
+
+All phases in this roadmap are now implemented. Future work would be new
+ideas beyond what's written down here.
 
 ## Cross-cutting
 

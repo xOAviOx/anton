@@ -69,6 +69,14 @@ Set PER_USER_SESSIONS=1 if more than one person shares ALLOWED_USER_IDS and
 you want each person to get their own project/session per channel instead of
 sharing one — off by default, so a solo setup is unaffected.
 
+!schedule add <spec> <prompt> recurs a prompt on an interval, daily, or weekly
+against the current project; !schedule list/pause/resume/remove manage them.
+
+Set WEBHOOK_PORT to run a GitHub webhook listener alongside the bot: an issue
+labeled "claude", or a failed CI run, on a repo listed in WEBHOOK_ROUTES
+dispatches a prompt into the mapped project + channel. Disabled by default;
+requires aiohttp and a WEBHOOK_SECRET.
+
 --------------------------------------------------------------------------------
 SETUP
 --------------------------------------------------------------------------------
@@ -115,6 +123,8 @@ whole point of remote control). So:
 """
 
 import asyncio
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -136,6 +146,15 @@ except ImportError:
     pass  # .env support is optional
 
 import discord
+
+# aiohttp is only needed for the GitHub webhook listener (Phase 5.2, WEBHOOK_PORT).
+# Optional so installing it isn't a hard requirement for everyone else.
+try:
+    import aiohttp
+    from aiohttp import web as aiohttp_web
+except ImportError:
+    aiohttp = None
+    aiohttp_web = None
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -217,6 +236,18 @@ STATIC_PROJECT_NAMES = frozenset(PROJECTS)
 # Optional directory to scan for git repos (`!discover`, and automatically at
 # startup if set) — one level deep, name = subdirectory basename.
 PROJECTS_ROOT = os.getenv("PROJECTS_ROOT")
+
+# GitHub webhook triggers (Phase 5.2). 0 = disabled (default). When enabled, an
+# issue labeled WEBHOOK_TRIGGER_LABEL, or a failed workflow_run/check_suite, on
+# a repo listed in WEBHOOK_ROUTES dispatches a prompt into the mapped project +
+# channel via _run_unattended() — same one-shot posture as !schedule.
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "0"))
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook/github")
+WEBHOOK_TRIGGER_LABEL = os.getenv("WEBHOOK_TRIGGER_LABEL", "claude")
+# {"owner/repo": {"project": "maestro", "channel_id": 123456789012345678}}
+_WEBHOOK_ROUTES_ENV = os.getenv("WEBHOOK_ROUTES")
+WEBHOOK_ROUTES: dict = json.loads(_WEBHOOK_ROUTES_ENV) if _WEBHOOK_ROUTES_ENV else {}
 
 ALLOWED_USER_IDS = {
     int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x
@@ -1705,66 +1736,69 @@ async def _fanout_one(name: str, path: str, prompt: str, model: Optional[str],
 
 
 # ---------------------------------------------------------------------------
-# Scheduled runs (Phase 5.1). Like fan-out, deliberately built on _fanout_one
-# rather than run_claude: this is an unattended background trigger with nobody
-# watching a live status message, so the simpler one-shot runner (fresh
-# session, no streaming activity feed, no reaction controls) is the right fit,
-# not a limitation worth building around here.
+# Unattended dispatch (Phase 5.1 + 5.2). Shared by !schedule and GitHub webhook
+# triggers — both fire with no originating discord.Message (nothing to reply
+# to, no live status message anyone's watching in real time), so both are
+# built on _fanout_one() (the Phase 6.2 one-shot runner: fresh session, no
+# streaming activity feed, no reaction controls, no !strict routing) rather
+# than run_claude.
 # ---------------------------------------------------------------------------
-async def _run_scheduled(row: sqlite3.Row) -> None:
-    channel = client.get_channel(row["channel_id"])
+async def _run_unattended(channel_id: int, author_id: int, project: str,
+                           prompt: str, tag: str) -> None:
+    """Run `prompt` against `project` and report back into `channel_id`, with no
+    originating message. `tag` is a short label for the status/result messages
+    (e.g. 'Scheduled `#42`', 'Issue `#7`'). Skips (doesn't queue or retry) if
+    the channel's already busy, the project's gone, or budget's exhausted —
+    the caller just waits for its own next trigger."""
+    channel = client.get_channel(channel_id)
     if channel is None:
         return  # channel not in cache (deleted, or bot not in it anymore) — skip silently
-    project = row["project"]
     path = PROJECTS.get(project)
     if path is None:
         try:
-            await channel.send(
-                f"⏰ Scheduled run `#{row['id']}` skipped: project `{project}` "
-                "is no longer configured."
-            )
+            await channel.send(f"⏰ {tag} skipped: project `{project}` is no longer configured.")
         except discord.HTTPException:
             pass
         return
     if (blocked := budget_blocked()):
         try:
-            await channel.send(f"⏰ Scheduled run `#{row['id']}` skipped: {blocked}")
+            await channel.send(f"⏰ {tag} skipped: {blocked}")
         except discord.HTTPException:
             pass
         return
 
-    st = state_for(row["channel_id"], row["author_id"])
+    st = state_for(channel_id, author_id)
     if st.lock.locked():
         # Don't queue behind an active run and don't dispatch into a project
-        # something else might be mid-edit on — just wait for the next slot.
+        # something else might be mid-edit on — just wait for the next trigger.
         try:
-            await channel.send(
-                f"⏰ Scheduled run `#{row['id']}` skipped: a task is already "
-                "running in this channel."
-            )
+            await channel.send(f"⏰ {tag} skipped: a task is already running in this channel.")
         except discord.HTTPException:
             pass
         return
 
     try:
-        await channel.send(
-            f"⏰ **Scheduled** `#{row['id']}` · **{project}** · `{preview(row['prompt'], 100)}`"
-        )
+        await channel.send(f"⏰ **{tag}** · **{project}** · `{preview(prompt, 100)}`")
     except discord.HTTPException:
         pass
 
     async with st.lock:
-        result = await _fanout_one(project, path, row["prompt"], st.model, row["channel_id"])
+        result = await _fanout_one(project, path, prompt, st.model, channel_id)
 
     icon = {"ok": "✅", "error": "⚠️", "timeout": "⏱️",
             "crash": "❌", "not-found": "❓"}.get(result["outcome"], "•")
     cost_bit = f" · ${result['cost']:.4f}" if result.get("cost") is not None else ""
-    body = f"{icon} Scheduled result `#{row['id']}`{cost_bit}:\n" + (result["text"] or "_(no output)_")
+    body = f"{icon} {tag} result{cost_bit}:\n" + (result["text"] or "_(no output)_")
     for piece in chunk(body) or [body[:MAX_MSG]]:
         try:
             await channel.send(piece)
         except discord.HTTPException:
             break
+
+
+async def _run_scheduled(row: sqlite3.Row) -> None:
+    await _run_unattended(row["channel_id"], row["author_id"], row["project"],
+                           row["prompt"], f"Scheduled `#{row['id']}`")
 
 
 async def schedule_ticker():
@@ -1783,6 +1817,82 @@ async def schedule_ticker():
         except Exception:  # noqa: BLE001 - a ticker hiccup must never crash the bot
             pass
         await asyncio.sleep(60)
+
+
+# ---------------------------------------------------------------------------
+# GitHub webhook triggers (Phase 5.2). Runs a small aiohttp server alongside
+# the Discord client (see main()/_amain()) only when WEBHOOK_PORT is set.
+# ---------------------------------------------------------------------------
+def _verify_github_signature(secret: str, body: bytes, signature_header: Optional[str]) -> bool:
+    """Constant-time check of GitHub's X-Hub-Signature-256 header."""
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature_header[len("sha256="):])
+
+
+def _prompt_for_github_event(event: str, payload: dict) -> Optional[tuple[str, str]]:
+    """Map a GitHub webhook event to (prompt, tag), or None if it's not one we
+    act on. Kept separate from the HTTP handler so the mapping logic can be
+    tested without spinning up aiohttp at all."""
+    if event == "issues" and payload.get("action") == "labeled":
+        label = (payload.get("label") or {}).get("name", "")
+        if label != WEBHOOK_TRIGGER_LABEL:
+            return None
+        issue = payload.get("issue") or {}
+        number, title = issue.get("number"), issue.get("title", "")
+        body_text = (issue.get("body") or "").strip()
+        prompt = (
+            f"Address GitHub issue #{number}: {title}\n\n{body_text}\n\n"
+            "Investigate and fix it, then commit your changes and open a PR "
+            "(`gh pr create`) describing the fix."
+        )
+        return prompt, f"Issue `#{number}`"
+
+    if event in ("workflow_run", "check_suite") and payload.get("action") == "completed":
+        obj = payload.get(event) or {}
+        if obj.get("conclusion") != "failure":
+            return None
+        name = obj.get("name") or obj.get("display_title") or "CI"
+        branch = obj.get("head_branch", "?")
+        url = obj.get("html_url", "")
+        prompt = (
+            f"CI failed: {name} on branch `{branch}`. Use `gh run view` (the failed "
+            f"run is {url}) to see the logs, investigate, attempt a fix, commit, and "
+            "open a PR (`gh pr create`)."
+        )
+        return prompt, f"CI failure ({name})"
+
+    return None
+
+
+async def _github_webhook_handler(request: "aiohttp_web.Request"):
+    body = await request.read()
+    if not _verify_github_signature(WEBHOOK_SECRET, body, request.headers.get("X-Hub-Signature-256")):
+        return aiohttp_web.Response(status=401, text="bad signature")
+    try:
+        payload = json.loads(body.decode(errors="replace"))
+    except json.JSONDecodeError:
+        return aiohttp_web.Response(status=400, text="bad json")
+
+    repo = (payload.get("repository") or {}).get("full_name")
+    route = WEBHOOK_ROUTES.get(repo) if repo else None
+    if not route or route.get("project") not in PROJECTS or not route.get("channel_id"):
+        return aiohttp_web.Response(status=204)  # unrouted/misconfigured — ack, ignore
+
+    mapped = _prompt_for_github_event(request.headers.get("X-GitHub-Event", ""), payload)
+    if mapped:
+        prompt, tag = mapped
+        asyncio.create_task(
+            _run_unattended(route["channel_id"], 0, route["project"], prompt, tag)
+        )
+    return aiohttp_web.Response(status=204)
+
+
+def _build_webhook_app() -> "aiohttp_web.Application":
+    app = aiohttp_web.Application()
+    app.router.add_post(WEBHOOK_PATH, _github_webhook_handler)
+    return app
 
 
 # ---------------------------------------------------------------------------
@@ -2621,11 +2731,38 @@ async def on_message(message: discord.Message):
         await notice.edit(content=f"✅ PR opened for **{st.project}**: {out or '(see GitHub)'}")
 
 
+async def _amain():
+    """Entry point when a GitHub webhook listener is enabled (Phase 5.2): starts
+    the aiohttp server first, then runs the Discord client in the same event
+    loop — client.run()'s own asyncio.run() wrapper can't be composed with
+    another server, so this replicates what it does under the hood."""
+    runner = aiohttp_web.AppRunner(_build_webhook_app())
+    await runner.setup()
+    site = aiohttp_web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
+    await site.start()
+    print(f"GitHub webhook listening on 0.0.0.0:{WEBHOOK_PORT}{WEBHOOK_PATH}")
+    try:
+        async with client:
+            await client.start(TOKEN)
+    finally:
+        await runner.cleanup()
+
+
 def main():
     if not TOKEN:
         sys.exit("DISCORD_TOKEN is not set.")
     if not ALLOWED_USER_IDS:
         sys.exit("ALLOWED_USER_IDS is empty — refusing to start an open bot.")
+    if WEBHOOK_PORT:
+        if aiohttp is None:
+            sys.exit("WEBHOOK_PORT is set but aiohttp isn't installed — "
+                      "pip install aiohttp, or unset WEBHOOK_PORT.")
+        if not WEBHOOK_SECRET:
+            sys.exit("WEBHOOK_SECRET must be set when WEBHOOK_PORT is enabled — "
+                      "an unauthenticated webhook would let anyone trigger a run.")
+        if not WEBHOOK_ROUTES:
+            print("WARNING: WEBHOOK_PORT is set but WEBHOOK_ROUTES is empty; "
+                  "every webhook delivery will be acknowledged and ignored.")
 
     # Phase 6.1: merge in projects added at runtime, then auto-discover any new
     # git repos under PROJECTS_ROOT (if set) before the bot starts taking commands.
@@ -2643,7 +2780,11 @@ def main():
 
     if not PROJECTS:
         print("WARNING: no PROJECTS configured; !cc won't work until you add one.")
-    client.run(TOKEN)
+
+    if WEBHOOK_PORT:
+        asyncio.run(_amain())
+    else:
+        client.run(TOKEN)
 
 
 if __name__ == "__main__":

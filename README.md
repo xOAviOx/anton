@@ -28,6 +28,8 @@ progress tool calls, file edits, and the final answer back into the channel.
   project at once
 - Scheduled runs: `!schedule add <spec> <prompt>` recurs a prompt every N
   minutes/hours/days, daily, or weekly
+- GitHub webhook triggers (`WEBHOOK_PORT`): an issue labeled `claude`, or a
+  failed CI run, dispatches a prompt automatically
 - Session continuity so follow-up messages continue the same conversation
 - State (project, session, usage) survives bot restarts
 - Optional per-user sessions (`PER_USER_SESSIONS=1`) if more than one person
@@ -281,6 +283,48 @@ schedule is skipped (and says so in the channel) rather than run if the
 channel already has an active task, if its project is no longer configured,
 or if `DAILY_BUDGET_USD` is already hit — it just waits for its next slot
 rather than queuing or retrying immediately.
+
+## GitHub webhook triggers
+
+Set `WEBHOOK_PORT` to run a small `aiohttp` web server alongside the bot
+(needs `pip install aiohttp`) that listens for GitHub webhook deliveries and
+turns some of them into Claude Code runs — an autonomous trigger rather than
+something you typed. Disabled by default (`WEBHOOK_PORT=0`).
+
+Setup, in a GitHub repo's Settings → Webhooks → Add webhook:
+
+- **Payload URL**: `http://your-host:<WEBHOOK_PORT><WEBHOOK_PATH>` (default
+  path is `/webhook/github`) — your host needs to actually be reachable from
+  GitHub's servers, so this typically means a reverse proxy or tunnel
+  (ngrok, Cloudflare Tunnel, etc.) in front of a home/office box.
+- **Content type**: `application/json`.
+- **Secret**: the same value as `WEBHOOK_SECRET`. This is mandatory — the bot
+  refuses to start with `WEBHOOK_PORT` set and no secret, since an
+  unauthenticated webhook would let anyone who finds the URL trigger a run on
+  your machine. Every delivery's `X-Hub-Signature-256` is verified before the
+  payload is even parsed.
+- **Events**: "Issues" (for the label trigger) and/or "Workflow runs" /
+  "Check suites" (for the CI-failure trigger).
+
+Then map the repo to a project and channel in `WEBHOOK_ROUTES`:
+`{"yourname/yourrepo": {"project": "maestro", "channel_id": 123456789012345678}}`.
+A repo not listed here gets every delivery acknowledged (`204`) and ignored —
+harmless, but worth knowing if a trigger doesn't seem to fire.
+
+Two triggers are wired up:
+
+- **Issue labeled `claude`** (configurable via `WEBHOOK_TRIGGER_LABEL`):
+  dispatches a prompt telling Claude to address that specific issue, commit,
+  and open a PR.
+- **`workflow_run` / `check_suite` completed with `conclusion: failure`**:
+  dispatches a prompt pointing Claude at the failed run (via `gh run view`)
+  to investigate, fix, commit, and open a PR.
+
+Like `!cc-all` and `!schedule`, webhook-triggered runs are one-shot (fresh
+session, no live activity feed, no reaction controls) and skip rather than
+queue if the target channel's already busy, the project's gone, or
+`DAILY_BUDGET_USD` is hit — there's no originating message to reply to and,
+being autonomous, no point queuing behind whatever else is happening.
 
 ## Multi-user
 

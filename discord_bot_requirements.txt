@@ -1,2 +1,5 @@
 discord.py>=2.3
 python-dotenv
+
+# Only needed if you set WEBHOOK_PORT (GitHub webhook triggers, Phase 5.2).
+# aiohttp>=3.9
