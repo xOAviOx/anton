@@ -10,6 +10,8 @@ progress tool calls, file edits, and the final answer back into the channel.
 - Live progress: streamed tool-use summaries while Claude works
 - Reaction controls on every run: 🛑 cancel (even while queued), 🔄 retry, 📄
   dump the full output as a file
+- Plan → approve → execute: `!plan` drafts a read-only plan and waits for a ✅
+  reaction before touching your files
 - Multiple projects, switchable per channel
 - Session continuity so follow-up messages continue the same conversation
 - State (project, session, usage) survives bot restarts
@@ -87,6 +89,21 @@ Every run's status message carries its own reaction controls:
 
 Only the most recent run per channel has live controls; older status
 messages' reactions become inert once a newer run starts.
+
+## Plan mode
+
+`!plan <prompt>` runs Claude Code in read-only **plan mode** first: it drafts
+an approach without editing any files, posts the plan into the channel, and adds
+two reactions to it:
+
+| Reaction | Effect |
+| --- | --- |
+| ✅ | Execute the plan — resumes the same session with `acceptEdits` and carries it out |
+| 🛑 | Discard the plan — nothing is changed |
+
+Because execution resumes the planning session, Claude keeps the full context of
+what it proposed. If you 🔄 retry a plan's status message it re-plans rather than
+executing. As with run controls, only the latest plan per channel stays live.
 
 ## Security
 

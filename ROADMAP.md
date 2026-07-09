@@ -46,7 +46,7 @@ These aren't user-facing features, but the feature phases below depend on them.
 
 A Discord bridge is uniquely good at approval loops you can drive from your phone.
 
-### 1.1 Reaction controls on the status message 🟢
+### 1.1 Reaction controls on the status message 🟢 ✅ done
 
 - **What:** React on the live status message to act without typing — 🛑 cancel,
   🔄 retry the last prompt, 📄 dump full output as a file attachment.
@@ -55,7 +55,7 @@ A Discord bridge is uniquely good at approval loops you can drive from your phon
   calls `kill()`; 🔄 re-invokes `run_claude` with the stored prompt; 📄 sends
   `final_text` as a `discord.File`.
 
-### 1.2 Plan → approve → execute 🟡
+### 1.2 Plan → approve → execute 🟡 ✅ done
 
 - **What:** Risky prompts run in plan mode first. Bot posts Claude's plan and waits
   for a ✅ reaction before executing; 🛑 discards.

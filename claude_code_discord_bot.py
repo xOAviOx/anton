@@ -10,6 +10,8 @@ streams live progress (tool calls) back into Discord, and posts the final answer
 Commands (default prefix "!"):
   !cc <prompt>      Run Claude Code with <prompt> in the current project.
                     Continues the channel's session if one exists.
+  !plan <prompt>    Draft a plan first (read-only). Bot posts the plan and waits
+                    for a ✅ reaction to execute it (or 🛑 to discard).
   !new              Start a fresh session for this channel.
   !project [name]   Show the current project, or switch to a configured one.
   !projects         List configured projects.
@@ -236,7 +238,8 @@ def state_for(channel_id: int) -> ChannelState:
 # Helpers
 # ---------------------------------------------------------------------------
 def build_command(prompt: str, session_id: Optional[str],
-                  model: Optional[str] = None) -> list[str]:
+                  model: Optional[str] = None,
+                  permission_mode: Optional[str] = None) -> list[str]:
     """Resolve the claude binary and assemble the headless invocation."""
     resolved = shutil.which(CLAUDE_BIN) or CLAUDE_BIN
     args = [
@@ -244,7 +247,7 @@ def build_command(prompt: str, session_id: Optional[str],
         "-p", prompt,
         "--output-format", "stream-json",
         "--verbose",
-        "--permission-mode", PERMISSION_MODE,
+        "--permission-mode", permission_mode or PERMISSION_MODE,
         "--allowedTools", ALLOWED_TOOLS,
     ]
     if model:
@@ -330,19 +333,29 @@ async def kill(proc: Optional[asyncio.subprocess.Process]):
 
 # ---------------------------------------------------------------------------
 # Reaction controls: 🛑 cancel / 🔄 retry / 📄 dump output on run status
-# messages.
+# messages, and ✅ execute / 🛑 discard on plan-mode proposals.
 # ---------------------------------------------------------------------------
 @dataclass
 class RunContext:
     channel_id: int
     prompt: str
     trigger_message: discord.Message
+    permission_mode: Optional[str] = None
+    plan_mode: bool = False
     final_text: str = ""
     cancelled: bool = False  # set by a 🛑 reaction while the run is still queued
 
+@dataclass
+class PlanContext:
+    channel_id: int
+    session_id: str
+    prompt: str
+    trigger_message: discord.Message
+
 # Keyed by the Discord message id carrying the controls. Pruned to the most
-# recent entry per channel (see run_claude) so this stays small forever.
+# recent entry per channel (see run_claude) so these stay small forever.
 RUN_BY_MESSAGE: dict[int, RunContext] = {}
+PLAN_BY_MESSAGE: dict[int, PlanContext] = {}
 
 
 async def _set_post_run_reactions(status: discord.Message):
@@ -363,18 +376,26 @@ async def _set_post_run_reactions(status: discord.Message):
 # ---------------------------------------------------------------------------
 # Core: run Claude Code and stream progress into a Discord message
 # ---------------------------------------------------------------------------
-async def run_claude(message: discord.Message, st: ChannelState, prompt: str):
+async def run_claude(message: discord.Message, st: ChannelState, prompt: str, *,
+                      permission_mode: Optional[str] = None, plan_mode: bool = False):
     channel_id = message.channel.id
     project_path = PROJECTS[st.project]
-    cmd = build_command(prompt, st.session_id, st.model)
+    cmd = build_command(prompt, st.session_id, st.model, permission_mode)
 
-    status = await message.reply(f"🧠 Working in **{st.project}**…")
+    icon = "📋" if plan_mode else "🧠"
+    verb = "Planning" if plan_mode else "Working"
+    status = await message.reply(f"{icon} {verb} in **{st.project}**…")
 
-    ctx = RunContext(channel_id=channel_id, prompt=prompt, trigger_message=message)
-    # Only the latest run for a channel should have live controls — an older
-    # 🛑/🔄/📄 pair would act on state a newer run already moved on from.
+    ctx = RunContext(
+        channel_id=channel_id, prompt=prompt, trigger_message=message,
+        permission_mode=permission_mode, plan_mode=plan_mode,
+    )
+    # Only the latest run/plan for a channel should have live controls — an
+    # older 🛑/🔄/📄 or ✅/🛑 pair would act on state a newer run already moved on from.
     for mid in [m for m, c in RUN_BY_MESSAGE.items() if c.channel_id == channel_id]:
         RUN_BY_MESSAGE.pop(mid, None)
+    for mid in [m for m, c in PLAN_BY_MESSAGE.items() if c.channel_id == channel_id]:
+        PLAN_BY_MESSAGE.pop(mid, None)
     RUN_BY_MESSAGE[status.id] = ctx
     try:
         await status.add_reaction("🛑")
@@ -391,7 +412,8 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str):
     async def render():
         nonlocal last_edit
         tail = activity[-12:]
-        body = f"🧠 **{st.project}** · running…\n" + ("\n".join(tail) if tail else "_thinking…_")
+        state_word = "planning" if plan_mode else "running"
+        body = f"{icon} **{st.project}** · {state_word}…\n" + ("\n".join(tail) if tail else "_thinking…_")
         try:
             await status.edit(content=body[:MAX_MSG])
         except discord.HTTPException:
@@ -483,26 +505,56 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str):
             stderr_bytes = await stderr_task
             stderr = stderr_bytes.decode(errors="replace")
 
-            st.session_id = new_session  # persist for next !cc
+            st.session_id = new_session  # persist for next !cc / plan approval
             st.runs += 1
             if cost is not None:
                 st.total_cost += cost
             ctx.final_text = final_text
 
-            # Final status line
-            footer = f"✅ done · **{st.project}**"
-            if cost is not None:
-                footer += f" · ${cost:.4f}"
-            if is_error or proc.returncode not in (0, None):
-                footer = f"⚠️ finished with issues · **{st.project}** (exit {proc.returncode})"
-            await status.edit(content=footer[:MAX_MSG])
+            failed = is_error or proc.returncode not in (0, None)
 
-            pieces = chunk(final_text) or ["_(no textual output)_"]
-            for p in pieces:
-                await message.channel.send(p)
-            if (is_error or proc.returncode not in (0, None)) and stderr.strip():
-                for p in chunk("stderr:\n" + stderr):
-                    await message.channel.send(f"```\n{p}\n```")
+            if failed:
+                footer = f"⚠️ finished with issues · **{st.project}** (exit {proc.returncode})"
+                await status.edit(content=footer[:MAX_MSG])
+                pieces = chunk(final_text) or ["_(no textual output)_"]
+                for p in pieces:
+                    await message.channel.send(p)
+                if stderr.strip():
+                    for p in chunk("stderr:\n" + stderr):
+                        await message.channel.send(f"```\n{p}\n```")
+
+            elif plan_mode:
+                footer = f"📋 plan ready · **{st.project}**"
+                if cost is not None:
+                    footer += f" · ${cost:.4f}"
+                await status.edit(content=footer[:MAX_MSG])
+
+                plan_body = f"📋 **Plan for {st.project}:**\n\n" + (final_text or "_(empty plan)_")
+                plan_msg = None
+                for p in chunk(plan_body) or [plan_body[:MAX_MSG]]:
+                    plan_msg = await message.channel.send(p)
+                if plan_msg and new_session:
+                    PLAN_BY_MESSAGE[plan_msg.id] = PlanContext(
+                        channel_id=channel_id, session_id=new_session,
+                        prompt=prompt, trigger_message=message,
+                    )
+                    try:
+                        await plan_msg.add_reaction("✅")
+                        await plan_msg.add_reaction("🛑")
+                    except discord.HTTPException:
+                        pass
+                    await message.channel.send(
+                        "React ✅ on the plan above to execute it, or 🛑 to discard."
+                    )
+
+            else:
+                footer = f"✅ done · **{st.project}**"
+                if cost is not None:
+                    footer += f" · ${cost:.4f}"
+                await status.edit(content=footer[:MAX_MSG])
+                pieces = chunk(final_text) or ["_(no textual output)_"]
+                for p in pieces:
+                    await message.channel.send(p)
 
         except asyncio.TimeoutError:
             await kill(st.proc)
@@ -540,6 +592,7 @@ client = discord.Client(intents=intents)
 HELP = (
     "**Claude Code control**\n"
     f"`{PREFIX}cc <prompt>` — run Claude Code in the current project (continues the session)\n"
+    f"`{PREFIX}plan <prompt>` — draft a plan first; react ✅ to execute it, 🛑 to discard\n"
     f"`{PREFIX}new` — start a fresh session\n"
     f"`{PREFIX}project [name]` — show or switch project\n"
     f"`{PREFIX}projects` — list projects\n"
@@ -577,6 +630,35 @@ async def on_reaction_add(reaction: discord.Reaction, user):
     msg = reaction.message
     channel = msg.channel
 
+    # ✅ execute / 🛑 discard on a plan proposal (Phase 1.2).
+    plan = PLAN_BY_MESSAGE.get(msg.id)
+    if plan is not None:
+        if emoji not in ("✅", "🛑"):
+            return
+        # One decision per plan — drop it so a later reaction can't re-fire.
+        PLAN_BY_MESSAGE.pop(msg.id, None)
+        st = state_for(plan.channel_id)
+        if emoji == "🛑":
+            await channel.send("🛑 Plan discarded.")
+        else:  # ✅ — resume the same session and carry the plan out.
+            if st.lock.locked():
+                await channel.send(
+                    "A task is already running in this channel — can't execute the plan yet."
+                )
+                PLAN_BY_MESSAGE[msg.id] = plan  # keep it approvable once free
+            else:
+                st.session_id = plan.session_id  # resume the planning session
+                async with st.lock:
+                    await run_claude(
+                        plan.trigger_message, st, plan.prompt,
+                        permission_mode="acceptEdits",
+                    )
+        try:
+            await reaction.remove(user)
+        except discord.HTTPException:
+            pass
+        return
+
     ctx = RUN_BY_MESSAGE.get(msg.id)
     if ctx is None:
         return
@@ -598,7 +680,10 @@ async def on_reaction_add(reaction: discord.Reaction, user):
             await channel.send("A task is already running in this channel.")
         else:
             async with st.lock:
-                await run_claude(ctx.trigger_message, st, ctx.prompt)
+                await run_claude(
+                    ctx.trigger_message, st, ctx.prompt,
+                    permission_mode=ctx.permission_mode, plan_mode=ctx.plan_mode,
+                )
 
     elif emoji == "📄":
         text = ctx.final_text or "_(no output captured for this run)_"
@@ -713,6 +798,22 @@ async def on_message(message: discord.Message):
             return
         async with st.lock:
             await run_claude(message, st, arg)
+
+    elif cmd == "plan":
+        if not arg:
+            await message.reply(f"Usage: `{PREFIX}plan <prompt>`")
+            return
+        if not st.project or st.project not in PROJECTS:
+            await message.reply(f"No valid project set. Use `{PREFIX}project <name>`.")
+            return
+        if st.lock.locked():
+            await message.reply(
+                f"A task is already running in this channel. `{PREFIX}cancel` to stop it, "
+                "or use another channel."
+            )
+            return
+        async with st.lock:
+            await run_claude(message, st, arg, plan_mode=True)
 
 
 def main():
