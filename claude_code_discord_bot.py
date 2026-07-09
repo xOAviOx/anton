@@ -58,7 +58,13 @@ Bash/Edit/Write/WebFetch/WebSearch/Task each wait for a ✅/❌ reaction before
 Claude Code is allowed to proceed (Read/Glob/Grep/TodoWrite stay auto-allowed).
 
 Each Discord channel keeps its own project + session, so you can run several
-projects in parallel from different channels.
+projects in parallel from different channels. Add projects at runtime with
+!addproject, or point PROJECTS_ROOT at a folder and use !discover to pick up
+git repos automatically. !cc-all fans one prompt out to every project at once.
+
+Set PER_USER_SESSIONS=1 if more than one person shares ALLOWED_USER_IDS and
+you want each person to get their own project/session per channel instead of
+sharing one — off by default, so a solo setup is unaffected.
 
 --------------------------------------------------------------------------------
 SETUP
@@ -218,23 +224,88 @@ ALLOWED_CHANNEL_IDS = {
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
+# Per-user sessions (Phase 6.3), off by default. When off, everyone in a channel
+# shares one ChannelState (today's behavior, unchanged) — state_for() always
+# collapses to author_id 0 regardless of who's asking. When on, each
+# (channel, author) pair gets its own project/session/lock/etc., so two
+# people in one channel don't clobber each other's session if ALLOWED_USER_IDS
+# has more than one person in it.
+PER_USER_SESSIONS = os.getenv("PER_USER_SESSIONS", "0").strip().lower() in ("1", "true", "yes", "on")
+
 # ---------------------------------------------------------------------------
 # Durable state (SQLite) — survives bot restarts
 # ---------------------------------------------------------------------------
+def _migrate_channel_state_for_per_user(conn: sqlite3.Connection) -> None:
+    """Phase 6.3: channel_state was originally PRIMARY KEY(channel_id) — one row
+    per channel, full stop. Per-user sessions need PRIMARY KEY(channel_id,
+    author_id), and SQLite can't ALTER a table's primary key in place, so this
+    copies the table across once: rename old -> create new with the composite
+    key -> copy every existing row in with author_id=0 (preserving today's
+    single-shared-state behavior exactly) -> drop the old table. Runs
+    unconditionally (regardless of PER_USER_SESSIONS) so the schema is always
+    ready if the flag gets flipped on later; idempotent via the author_id
+    column check, same pattern as the other migrations below."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(channel_state)").fetchall()]
+    if not cols or "author_id" in cols:
+        return  # nothing to migrate (either a fresh DB, or already migrated)
+
+    # The old table may or may not yet have the later per-column migrations
+    # (run_branch etc.) depending on how long ago it was last touched — select
+    # each as a literal fallback (NULL, or 0 for strict_mode) when absent, rather
+    # than assuming every prior migration already ran.
+    old_cols = set(cols)
+    optional = {"run_branch": "NULL", "branched_for_session": "NULL",
+                "pre_run_ref": "NULL", "strict_mode": "0"}
+    select_list = ", ".join(
+        name if name in old_cols else literal
+        for name, literal in optional.items()
+    )
+
+    conn.execute("ALTER TABLE channel_state RENAME TO channel_state_pre_v6_3")
+    conn.execute(
+        """
+        CREATE TABLE channel_state (
+            channel_id           INTEGER NOT NULL,
+            author_id            INTEGER NOT NULL DEFAULT 0,
+            project              TEXT,
+            session_id           TEXT,
+            model                TEXT,
+            runs                 INTEGER NOT NULL DEFAULT 0,
+            total_cost           REAL NOT NULL DEFAULT 0.0,
+            run_branch           TEXT,
+            branched_for_session TEXT,
+            pre_run_ref          TEXT,
+            strict_mode          INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (channel_id, author_id)
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO channel_state (channel_id, author_id, project, session_id, model, "
+        "runs, total_cost, run_branch, branched_for_session, pre_run_ref, strict_mode) "
+        f"SELECT channel_id, 0, project, session_id, model, runs, total_cost, {select_list} "
+        "FROM channel_state_pre_v6_3"
+    )
+    conn.execute("DROP TABLE channel_state_pre_v6_3")
+
+
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS channel_state (
-            channel_id  INTEGER PRIMARY KEY,
+            channel_id  INTEGER NOT NULL,
+            author_id   INTEGER NOT NULL DEFAULT 0,
             project     TEXT,
             session_id  TEXT,
             model       TEXT,
             runs        INTEGER NOT NULL DEFAULT 0,
-            total_cost  REAL NOT NULL DEFAULT 0.0
+            total_cost  REAL NOT NULL DEFAULT 0.0,
+            PRIMARY KEY (channel_id, author_id)
         )
         """
     )
+    _migrate_channel_state_for_per_user(conn)
     # Phase 2 git-safety columns, added by migration so pre-Phase-2 databases
     # upgrade in place. run_branch: the anton/… branch for the current session;
     # branched_for_session: which session_id we already branched for (idempotence);
@@ -300,15 +371,17 @@ def _db() -> sqlite3.Connection:
     return conn
 
 
-def _load_row(channel_id: int) -> Optional[sqlite3.Row]:
+def _load_row(channel_id: int, author_id: int = 0) -> Optional[sqlite3.Row]:
+    """author_id is always 0 unless PER_USER_SESSIONS is on (see state_for) —
+    that's what makes today's single-shared-state behavior the default."""
     conn = _db()
     try:
         conn.row_factory = sqlite3.Row
         return conn.execute(
             "SELECT project, session_id, model, runs, total_cost, "
             "run_branch, branched_for_session, pre_run_ref, strict_mode "
-            "FROM channel_state WHERE channel_id = ?",
-            (channel_id,),
+            "FROM channel_state WHERE channel_id = ? AND author_id = ?",
+            (channel_id, author_id),
         ).fetchone()
     finally:
         conn.close()
@@ -317,16 +390,19 @@ def _load_row(channel_id: int) -> Optional[sqlite3.Row]:
 def save_state(channel_id: int, st: "ChannelState") -> None:
     """Persist the durable fields of a channel's state to SQLite. Called after
     every mutation (session/project/model change, run completion) so a bot
-    restart doesn't lose in-flight conversations."""
+    restart doesn't lose in-flight conversations. The author_id half of the key
+    comes from st.author_id (set once by state_for()) rather than a separate
+    parameter, so every existing save_state(channel_id, st) call site needed no
+    changes for Phase 6.3 — it's always 0 unless PER_USER_SESSIONS is on."""
     conn = _db()
     try:
         conn.execute(
             """
             INSERT INTO channel_state
-                (channel_id, project, session_id, model, runs, total_cost,
+                (channel_id, author_id, project, session_id, model, runs, total_cost,
                  run_branch, branched_for_session, pre_run_ref, strict_mode)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(channel_id) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel_id, author_id) DO UPDATE SET
                 project              = excluded.project,
                 session_id           = excluded.session_id,
                 model                = excluded.model,
@@ -337,8 +413,9 @@ def save_state(channel_id: int, st: "ChannelState") -> None:
                 pre_run_ref          = excluded.pre_run_ref,
                 strict_mode          = excluded.strict_mode
             """,
-            (channel_id, st.project, st.session_id, st.model, st.runs, st.total_cost,
-             st.run_branch, st.branched_for_session, st.pre_run_ref, int(st.strict_mode)),
+            (channel_id, st.author_id, st.project, st.session_id, st.model, st.runs,
+             st.total_cost, st.run_branch, st.branched_for_session, st.pre_run_ref,
+             int(st.strict_mode)),
         )
         conn.commit()
     finally:
@@ -494,16 +571,29 @@ class ChannelState:
     pre_run_ref: Optional[str] = None
     # Live permission prompts (Phase 1.3), persisted. See !strict.
     strict_mode: bool = False
+    # Per-user sessions (Phase 6.3). Always 0 unless PER_USER_SESSIONS is on — see
+    # state_for(). Set once at creation and read back by save_state(), so no
+    # existing save_state(channel_id, st) call site needed to change.
+    author_id: int = 0
 
-STATE: dict[int, ChannelState] = {}
+# Keyed by (channel_id, effective_author_id) — effective_author_id collapses to
+# 0 for everyone unless PER_USER_SESSIONS is on (see state_for), which is what
+# makes "one shared state per channel" the default, unchanged behavior.
+STATE: dict[tuple[int, int], ChannelState] = {}
 
 # Caps how many `claude` processes can run at once across all channels/projects.
 RUN_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT)
 
-def state_for(channel_id: int) -> ChannelState:
-    st = STATE.get(channel_id)
+def state_for(channel_id: int, author_id: int = 0) -> ChannelState:
+    """Look up (or create) the ChannelState for a channel — and, if
+    PER_USER_SESSIONS is on, a specific author within it. Callers always pass
+    the real author_id (e.g. message.author.id); this function is the one place
+    that decides whether it actually matters."""
+    effective_author = author_id if PER_USER_SESSIONS else 0
+    key = (channel_id, effective_author)
+    st = STATE.get(key)
     if st is None:
-        row = _load_row(channel_id)
+        row = _load_row(channel_id, effective_author)
         if row is not None:
             st = ChannelState(
                 project=row["project"] or DEFAULT_PROJECT,
@@ -515,11 +605,12 @@ def state_for(channel_id: int) -> ChannelState:
                 branched_for_session=row["branched_for_session"],
                 pre_run_ref=row["pre_run_ref"],
                 strict_mode=bool(row["strict_mode"]),
+                author_id=effective_author,
             )
         else:
-            st = ChannelState(project=DEFAULT_PROJECT)
+            st = ChannelState(project=DEFAULT_PROJECT, author_id=effective_author)
             save_state(channel_id, st)
-        STATE[channel_id] = st
+        STATE[key] = st
     return st
 
 # ---------------------------------------------------------------------------
@@ -857,6 +948,10 @@ class RunContext:
     plan_mode: bool = False
     final_text: str = ""
     cancelled: bool = False  # set by a 🛑 reaction while the run is still queued
+    # Per-user sessions (Phase 6.3): the effective author_id (0 unless
+    # PER_USER_SESSIONS is on) this run's state belongs to, so pruning and
+    # reaction lookups can be scoped per-user instead of per-channel.
+    author_id: int = 0
 
 @dataclass
 class PlanContext:
@@ -864,12 +959,14 @@ class PlanContext:
     session_id: str
     prompt: str
     trigger_message: discord.Message
+    author_id: int = 0
 
 @dataclass
 class RevertContext:
     channel_id: int
     ref: str      # pre-run HEAD to reset back to
     project: str
+    author_id: int = 0
 
 @dataclass
 class ResultContext:
@@ -1046,13 +1143,17 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str, *,
 
     ctx = RunContext(
         channel_id=channel_id, prompt=prompt, trigger_message=message,
-        permission_mode=permission_mode, plan_mode=plan_mode,
+        permission_mode=permission_mode, plan_mode=plan_mode, author_id=st.author_id,
     )
-    # Only the latest run/plan for a channel should have live controls — an
-    # older 🛑/🔄/📄 or ✅/🛑 pair would act on state a newer run already moved on from.
-    for mid in [m for m, c in RUN_BY_MESSAGE.items() if c.channel_id == channel_id]:
+    # Only the latest run/plan for a (channel, author) should have live controls —
+    # an older 🛑/🔄/📄 or ✅/🛑 pair would act on state a newer run already moved on
+    # from. Scoped by author_id too (always 0 unless PER_USER_SESSIONS is on) so
+    # two collaborators' controls in the same channel don't cancel each other out.
+    for mid in [m for m, c in RUN_BY_MESSAGE.items()
+                if c.channel_id == channel_id and c.author_id == st.author_id]:
         RUN_BY_MESSAGE.pop(mid, None)
-    for mid in [m for m, c in PLAN_BY_MESSAGE.items() if c.channel_id == channel_id]:
+    for mid in [m for m, c in PLAN_BY_MESSAGE.items()
+                if c.channel_id == channel_id and c.author_id == st.author_id]:
         PLAN_BY_MESSAGE.pop(mid, None)
     RUN_BY_MESSAGE[status.id] = ctx
     try:
@@ -1230,7 +1331,7 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str, *,
                 if plan_msg and new_session:
                     PLAN_BY_MESSAGE[plan_msg.id] = PlanContext(
                         channel_id=channel_id, session_id=new_session,
-                        prompt=prompt, trigger_message=message,
+                        prompt=prompt, trigger_message=message, author_id=st.author_id,
                     )
                     try:
                         await plan_msg.add_reaction("✅")
@@ -1279,6 +1380,15 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str, *,
                 # process died with the run). Deny it now rather than leaving a
                 # ✅/❌ card sitting in Discord forever; approval_watcher() will
                 # notice the status change and edit the message accordingly.
+                # KNOWN LIMITATION (Phase 6.3): the approvals table has no
+                # author_id, so this is scoped to the whole channel — if
+                # PER_USER_SESSIONS is on and two different users each have a
+                # strict-mode run going in the same channel, one run ending
+                # will also deny the other user's still-pending approval.
+                # Combining !strict with concurrent per-user runs in one
+                # channel is a narrow enough case that this is documented
+                # rather than plumbed through (would need an author_id column
+                # here plus an ANTON_AUTHOR_ID env var into the MCP helper).
                 try:
                     conn = _db()
                     try:
@@ -1485,7 +1595,7 @@ async def on_reaction_add(reaction: discord.Reaction, user):
             return
         # One decision per plan — drop it so a later reaction can't re-fire.
         PLAN_BY_MESSAGE.pop(msg.id, None)
-        st = state_for(plan.channel_id)
+        st = state_for(plan.channel_id, plan.author_id)
         if emoji == "🛑":
             await channel.send("🛑 Plan discarded.")
         else:  # ✅ — resume the same session and carry the plan out.
@@ -1513,7 +1623,7 @@ async def on_reaction_add(reaction: discord.Reaction, user):
         if emoji not in ("✅", "🛑"):
             return
         REVERT_BY_MESSAGE.pop(msg.id, None)  # one decision per confirmation
-        st = state_for(rev.channel_id)
+        st = state_for(rev.channel_id, rev.author_id)
         if emoji == "🛑":
             await channel.send("🛑 Revert cancelled — your changes are untouched.")
         elif st.proc and st.proc.returncode is None:
@@ -1573,7 +1683,7 @@ async def on_reaction_add(reaction: discord.Reaction, user):
     if emoji not in ("🛑", "🔄", "📄"):
         return
 
-    st = state_for(ctx.channel_id)
+    st = state_for(ctx.channel_id, ctx.author_id)
 
     if emoji == "🛑":
         ctx.cancelled = True
@@ -1617,7 +1727,7 @@ async def on_message(message: discord.Message):
         if not authorized(message):
             return
         rctx = RESULT_BY_MESSAGE[ref_id]
-        st = state_for(message.channel.id)
+        st = state_for(message.channel.id, message.author.id)
         if rctx.project not in PROJECTS:
             await message.reply(
                 f"That thread's project (`{rctx.project}`) is no longer configured."
@@ -1651,7 +1761,7 @@ async def on_message(message: discord.Message):
     parts = message.content[len(PREFIX):].split(maxsplit=1)
     cmd = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
-    st = state_for(message.channel.id)
+    st = state_for(message.channel.id, message.author.id)
     global DEFAULT_PROJECT  # mutated by !addproject/!discover when no default is set yet
 
     if cmd == "help":
@@ -2040,6 +2150,7 @@ async def on_message(message: discord.Message):
         )
         REVERT_BY_MESSAGE[warn.id] = RevertContext(
             channel_id=message.channel.id, ref=st.pre_run_ref, project=st.project,
+            author_id=st.author_id,
         )
         try:
             await warn.add_reaction("✅")

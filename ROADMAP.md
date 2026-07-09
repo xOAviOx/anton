@@ -339,11 +339,57 @@ safety layer. All of these shell out with `cwd=PROJECTS[st.project]`.
 > than ship something ambiguous, strict mode is just out of scope for
 > fan-out for now.
 
-### 6.3 Per-user sessions 🟡
+### 6.3 Per-user sessions 🟡 ✅ done
 
 - **What:** If collaborators are added, keep sessions per `(channel, user)` so two
   people don't clobber one channel's session.
 - **How:** Key `STATE` on `(channel_id, author_id)` instead of `channel_id`.
+
+> **Implementation notes (shipped):** opt-in via `PER_USER_SESSIONS` (default
+> off = today's exact behavior). The load-bearing trick is in `state_for()`:
+> it always collapses `author_id` to `0` unless the flag is on
+> (`effective_author = author_id if PER_USER_SESSIONS else 0`), so every
+> caller can unconditionally pass the real `message.author.id` and the
+> function itself decides whether that matters. `ChannelState` gained an
+> `author_id` field (set once at creation, read back by `save_state()`), so
+> `save_state(channel_id, st)`'s signature never had to change — only
+> `state_for()` call sites needed updating to also pass `message.author.id`.
+>
+> The database side needed an actual migration, not just an added column:
+> `channel_state` was `PRIMARY KEY(channel_id)`, and SQLite can't alter a
+> primary key in place. `_migrate_channel_state_for_per_user()` runs
+> unconditionally (regardless of the flag — so the schema's always ready if
+> it's flipped on later) and does the rename-old / create-new-with-composite-
+> key / copy-rows-in-with-author_id=0 / drop-old dance, handling the case
+> where the old table predates some of the later per-column migrations
+> (falls back to `NULL`/`0` literals for any column not present). Verified
+> against a simulated pre-6.3 database (single-column PK, populated row) that
+> the migration preserves every field exactly and the resulting `state_for()`
+> call returns it correctly; also verified the flag actually isolates two
+> different `author_id`s in one channel when on, and that they share state
+> (same object) when off, and that per-user state survives a simulated
+> restart (fresh `STATE` dict, reload from disk).
+>
+> Reaction-control scoping (`RUN_BY_MESSAGE`/`PLAN_BY_MESSAGE` pruning, plus
+> `RunContext`/`PlanContext`/`RevertContext`) also gained an `author_id`
+> field and matching comparisons — without this, one person's run in a
+> shared channel would silently clear another person's pending 🛑/🔄/📄 or
+> ✅/🛑 controls even though their sessions are otherwise isolated. Reply-to-
+> continue is deliberately the one exception: replying to *anyone's* result
+> message resumes that thread into the replier's own per-user slot, since
+> it's about which conversation thread to continue, not whose session
+> originally posted it.
+>
+> Deliberately left channel-wide (not per-user) rather than expanding
+> further: `!history`/`!cost`/budget tracking (the `runs` table has no
+> author_id — these are about spend/audit trail, not conversational state),
+> and the Phase 1.3 `approvals` table (also no author_id, since
+> `anton_mcp_approve.py` only ever receives `ANTON_CHANNEL_ID`). The latter
+> means one known gap: if `PER_USER_SESSIONS=1` and two people each have a
+> `!strict`-mode run going in the same channel at once, one run ending also
+> denies the other's still-pending approval. Documented in the README rather
+> than fixed — plumbing an `ANTON_AUTHOR_ID` through the whole permission-
+> prompt-tool chain for a narrow double-opt-in edge case wasn't worth it.
 
 ---
 

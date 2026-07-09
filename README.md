@@ -24,8 +24,12 @@ progress tool calls, file edits, and the final answer back into the channel.
   auto-accepting
 - Multiple projects, switchable per channel — add new ones at runtime with
   `!addproject`, or auto-discover git repos under a folder with `!discover`
+- Fan-out: `!cc-all <prompt>` runs the same prompt against every configured
+  project at once
 - Session continuity so follow-up messages continue the same conversation
 - State (project, session, usage) survives bot restarts
+- Optional per-user sessions (`PER_USER_SESSIONS=1`) if more than one person
+  shares the bot, so they don't clobber each other's session in one channel
 - A global concurrency cap keeps too many `claude` processes from piling up
 - Long replies are automatically split to fit Discord's message limit
 - Locked down to specific users (and optionally specific channels)
@@ -250,6 +254,39 @@ potentially finishing at once, an approval card can't unambiguously show
 which project's Bash command it's asking about, so fan-out always runs at
 the normal (non-strict) permission posture regardless of the channel's
 `!strict` setting.
+
+## Multi-user
+
+By default every command in a channel operates on one shared `ChannelState` —
+whoever's `ALLOWED_USER_IDS` you configured, they all see the same current
+project, session, and `!strict` setting per channel. That's the simplest
+setup for one person, and it's still what happens even with multiple allowed
+users unless you turn this on.
+
+Set `PER_USER_SESSIONS=1` to key state by `(channel, author)` instead: each
+person gets their own project/session/lock/`!strict` setting per channel, so
+two collaborators typing in the same channel don't stomp on each other's
+in-flight conversation. Reaction controls (🛑/🔄/📄, plan approval) are scoped
+the same way, so one person's controls don't get silently cleared out from
+under them when someone else kicks off a run in the same channel. Reply-to-
+continue is the one exception by design — replying to *anyone's* result
+message resumes that thread into your own per-user slot, since it's about
+picking up a specific conversation thread, not about whose session originally
+posted it.
+
+Turning this on triggers a one-time, automatic SQLite migration (adds an
+`author_id` column and switches the primary key to `(channel_id, author_id)`)
+— existing rows come through unchanged with `author_id=0`, so nothing about
+your current single-shared-state setup breaks if you never enable the flag,
+and nothing about your history is lost if you turn it on later. `!history`/
+`!cost`/budget tracking stay channel-wide (not per-user) either way — those
+are about spend and audit trail, not conversational state.
+
+One narrow combination isn't fully isolated: if `PER_USER_SESSIONS=1` and two
+different people each have a `!strict`-mode run going in the *same* channel
+at the same time, one run ending will also auto-deny the other person's
+still-pending approval card (the approvals table doesn't carry an author_id).
+Rare enough in practice that it's called out here rather than built around.
 
 ## Security
 
