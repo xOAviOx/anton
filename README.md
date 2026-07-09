@@ -237,6 +237,20 @@ at startup — handy if you keep all your repos under one parent folder and
 want new clones to show up without restarting the bot (just run `!discover`
 again after cloning).
 
+`!cc-all <prompt>` fans the same prompt out to *every* configured project at
+once — e.g. "bump the license year to 2027" across your whole workspace. Each
+project gets its own fresh one-off run (no `--resume`, no session, no
+reaction controls — this is a broadcast, not an interactive conversation) and
+they're all still capped by `MAX_CONCURRENT`, so a fan-out across ten
+projects with the default cap of 2 just serializes five-at-a-time rather than
+launching ten `claude` processes at once. Results stream back into one status
+message as each project finishes, and each still gets logged for `!history`/
+`!cost`. It does *not* go through `!strict` — with several projects
+potentially finishing at once, an approval card can't unambiguously show
+which project's Bash command it's asking about, so fan-out always runs at
+the normal (non-strict) permission posture regardless of the channel's
+`!strict` setting.
+
 ## Security
 
 Never commit your real `.env` — it holds your bot token. It is already listed in

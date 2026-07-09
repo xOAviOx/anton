@@ -10,6 +10,8 @@ streams live progress (tool calls) back into Discord, and posts the final answer
 Commands (default prefix "!"):
   !cc <prompt>      Run Claude Code with <prompt> in the current project.
                     Continues the channel's session if one exists.
+  !cc-all <prompt>  Fan out <prompt> to every configured project at once (a
+                    fresh one-off run each, no session/reactions).
   !plan <prompt>    Draft a plan first (read-only). Bot posts the plan and waits
                     for a ✅ reaction to execute it (or 🛑 to discard).
   !new              Start a fresh session for this channel.
@@ -1324,6 +1326,77 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str, *,
                         pass
             await _set_post_run_reactions(status)
 
+
+# ---------------------------------------------------------------------------
+# Fan-out (Phase 6.2): !cc-all runs the same prompt against every configured
+# project. Deliberately NOT run_claude — that function's channel_id doubles as
+# the persistence key for the invoking channel's own project/session, and N
+# concurrent dispatches sharing one real channel would clobber each other's
+# state if they all wrote through save_state(). This is a simpler, one-off,
+# non-persisted broadcast: no live per-tool activity feed, no session (always
+# fresh), no reaction controls — just "run this everywhere and report back".
+# It still logs to the runs table (so !history/!cost see it) and still goes
+# through RUN_SEMAPHORE (so it can't blow past MAX_CONCURRENT alongside
+# whatever else the bot is doing).
+# ---------------------------------------------------------------------------
+async def _fanout_one(name: str, path: str, prompt: str, model: Optional[str],
+                       channel_id: int) -> dict:
+    """Run one project's share of a !cc-all fan-out to completion and return a
+    small result dict: {project, outcome, text, cost, duration}."""
+    cmd = build_command(prompt, None, model)  # fresh session, normal permission posture
+    start = time.monotonic()
+    result: dict = {"project": name, "outcome": "crash", "text": "", "cost": None,
+                     "session_id": None}
+    async with RUN_SEMAPHORE:
+        proc = None
+        try:
+            spawn_kwargs = {}
+            if os.name != "nt":
+                spawn_kwargs["start_new_session"] = True
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, cwd=path,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                **spawn_kwargs,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=RUN_TIMEOUT)
+            final_text, cost, is_error, session_id = "", None, False, None
+            for line in out.decode(errors="replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if evt.get("type") == "result":
+                    final_text = evt.get("result") or final_text
+                    cost = evt.get("total_cost_usd", cost)
+                    is_error = bool(evt.get("is_error"))
+                    session_id = evt.get("session_id", session_id)
+            failed = is_error or proc.returncode not in (0, None)
+            result.update(outcome="error" if failed else "ok", text=final_text,
+                          cost=cost, session_id=session_id)
+        except asyncio.TimeoutError:
+            if proc is not None:
+                await kill(proc)
+            result.update(outcome="timeout", text=f"timed out after {RUN_TIMEOUT}s")
+        except FileNotFoundError:
+            result.update(outcome="not-found", text="`claude` not found")
+        except Exception as e:  # noqa: BLE001 - one project's crash mustn't sink the fan-out
+            result.update(outcome="crash", text=f"{type(e).__name__}: {str(e)[:200]}")
+        finally:
+            duration = time.monotonic() - start
+            result["duration"] = duration
+            try:
+                log_run(
+                    channel_id=channel_id, project=name, session_id=result["session_id"],
+                    prompt=prompt[:500], cost=result["cost"], duration=duration,
+                    files_changed=None, outcome=result["outcome"], ts=time.time(),
+                )
+            except Exception:  # noqa: BLE001 - logging must never break the fan-out
+                pass
+    return result
+
 # ---------------------------------------------------------------------------
 # Discord client + command handling
 # ---------------------------------------------------------------------------
@@ -1334,6 +1407,7 @@ client = discord.Client(intents=intents)
 HELP = (
     "**Claude Code control**\n"
     f"`{PREFIX}cc <prompt>` — run Claude Code in the current project (continues the session)\n"
+    f"`{PREFIX}cc-all <prompt>` — fan out to every configured project (fresh one-off runs)\n"
     f"`{PREFIX}plan <prompt>` — draft a plan first; react ✅ to execute it, 🛑 to discard\n"
     f"`{PREFIX}new` — start a fresh session\n"
     f"`{PREFIX}project [name]` — show or switch project\n"
@@ -1845,6 +1919,50 @@ async def on_message(message: discord.Message):
             return
         async with st.lock:
             await run_claude(message, st, augment_prompt(arg, files))
+
+    elif cmd == "cc-all":
+        if not PROJECTS:
+            await message.reply("No projects configured.")
+            return
+        if not arg:
+            await message.reply(f"Usage: `{PREFIX}cc-all <prompt>` — runs against every configured project.")
+            return
+        if (blocked := budget_blocked()):
+            await message.reply(blocked)
+            return
+
+        project_items = list(PROJECTS.items())
+        status_lines = {name: "⏳ queued" for name, _ in project_items}
+
+        def render_fanout() -> str:
+            body = f"🔀 **Fan-out** across {len(project_items)} project(s) · `{preview(arg, 80)}`\n"
+            body += "\n".join(f"• **{n}** — {status_lines[n]}" for n, _ in project_items)
+            return body[:MAX_MSG]
+
+        status_msg = await message.reply(render_fanout())
+        fanout_tasks = [
+            asyncio.create_task(_fanout_one(name, path, arg, st.model, message.channel.id))
+            for name, path in project_items
+        ]
+        last_edit = 0.0
+        for coro in asyncio.as_completed(fanout_tasks):
+            res = await coro
+            icon = {"ok": "✅", "error": "⚠️", "timeout": "⏱️",
+                    "crash": "❌", "not-found": "❓"}.get(res["outcome"], "•")
+            cost_bit = f" · ${res['cost']:.4f}" if res.get("cost") is not None else ""
+            text_bit = preview(res["text"], 200) or "_(no output)_"
+            status_lines[res["project"]] = f"{icon}{cost_bit} — {text_bit}"
+            now = time.monotonic()
+            if now - last_edit > STATUS_EDIT_INTERVAL:
+                try:
+                    await status_msg.edit(content=render_fanout())
+                except discord.HTTPException:
+                    pass
+                last_edit = now
+        try:
+            await status_msg.edit(content=render_fanout())
+        except discord.HTTPException:
+            pass
 
     elif cmd == "plan":
         if not st.project or st.project not in PROJECTS:

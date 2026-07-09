@@ -310,12 +310,34 @@ safety layer. All of these shell out with `cwd=PROJECTS[st.project]`.
 > discord.py installed: discovery, add, remove, and the static-wins-over-
 > runtime merge precedence all round-trip correctly through SQLite.
 
-### 6.2 Fan-out (`!cc-all <prompt>`) 🟡
+### 6.2 Fan-out (`!cc-all <prompt>`) 🟡 ✅ done
 
 - **What:** Run the same prompt across several projects (e.g. "bump the license
   year") and report per-project results.
 - **How:** Loop the configured projects, dispatch each under the global semaphore,
   and post a compact per-project summary.
+
+> **Implementation notes (shipped):** deliberately *not* built on `run_claude`
+> — that function's `channel_id` doubles as the SQLite persistence key for
+> the invoking channel's own project/session, and N concurrent dispatches
+> all sharing the one real channel would clobber each other's row if they
+> each called `save_state()`. `_fanout_one()` is a simpler, self-contained
+> one-off runner: fresh session every time (no `--resume`), no live per-tool
+> activity feed, no reaction controls — just spawn, collect the `result`
+> event, log it, done. It still acquires `RUN_SEMAPHORE` itself, so a
+> fan-out across many projects with a low `MAX_CONCURRENT` correctly
+> serializes instead of spawning everything at once (verified: with
+> `MAX_CONCURRENT=1` and two dispatches, total wall time ≈ sum of the two
+> individual run times, not `max()` of them). Each project's result is still
+> written to the `runs` table under the invoking channel_id, so `!history`/
+> `!cost` see fan-out runs same as any other. Scope decision: fan-out
+> ignores the channel's `!strict` setting and always uses the normal
+> permission posture — with several projects potentially awaiting approval
+> at once in the same channel, an approval card has no way to show *which*
+> project's Bash command it's asking about (the permission-prompt-tool
+> protocol only carries `tool_name`/`input`, not project context), so rather
+> than ship something ambiguous, strict mode is just out of scope for
+> fan-out for now.
 
 ### 6.3 Per-user sessions 🟡
 
