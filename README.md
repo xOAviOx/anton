@@ -26,6 +26,8 @@ progress tool calls, file edits, and the final answer back into the channel.
   `!addproject`, or auto-discover git repos under a folder with `!discover`
 - Fan-out: `!cc-all <prompt>` runs the same prompt against every configured
   project at once
+- Scheduled runs: `!schedule add <spec> <prompt>` recurs a prompt every N
+  minutes/hours/days, daily, or weekly
 - Session continuity so follow-up messages continue the same conversation
 - State (project, session, usage) survives bot restarts
 - Optional per-user sessions (`PER_USER_SESSIONS=1`) if more than one person
@@ -254,6 +256,31 @@ potentially finishing at once, an approval card can't unambiguously show
 which project's Bash command it's asking about, so fan-out always runs at
 the normal (non-strict) permission posture regardless of the channel's
 `!strict` setting.
+
+## Scheduled runs
+
+`!schedule add <spec> <prompt>` recurs a prompt against the channel's current
+project. Three spec forms:
+
+| Spec | Meaning |
+| --- | --- |
+| `every <N>m` / `<N>h` / `<N>d` | Every N minutes/hours/days from now (sub-minute intervals are refused) |
+| `daily HH:MM` | Every day at that local time |
+| `weekly <mon\|tue\|...\|sun> HH:MM` | Every week on that day, at that local time |
+
+`!schedule list` shows this channel's schedules with their id, next run time,
+and enabled/paused state; `!schedule pause <id>` / `!schedule resume <id>`
+toggles one without deleting it; `!schedule remove <id>` deletes it. A
+background task checks once a minute for anything due and dispatches it.
+
+Like `!cc-all`, scheduled runs are one-shot: a fresh session each time (no
+`--resume`), no live activity feed, no reaction controls, no `!strict`
+routing — this is an unattended background trigger, and by the time you read
+the result nobody was watching a status message update live anyway. A
+schedule is skipped (and says so in the channel) rather than run if the
+channel already has an active task, if its project is no longer configured,
+or if `DAILY_BUDGET_USD` is already hit — it just waits for its next slot
+rather than queuing or retrying immediately.
 
 ## Multi-user
 

@@ -12,6 +12,9 @@ Commands (default prefix "!"):
                     Continues the channel's session if one exists.
   !cc-all <prompt>  Fan out <prompt> to every configured project at once (a
                     fresh one-off run each, no session/reactions).
+  !schedule add <spec> <prompt>  Recurring prompt (every Nm/Nh/Nd, daily
+                    HH:MM, or weekly <day> HH:MM) against the current project.
+  !schedule list/pause/resume/remove <id>  Manage this channel's schedules.
   !plan <prompt>    Draft a plan first (read-only). Bot posts the plan and waits
                     for a ✅ reaction to execute it (or 🛑 to discard).
   !new              Start a fresh session for this channel.
@@ -367,6 +370,26 @@ def _db() -> sqlite3.Connection:
         )
         """
     )
+    # Phase 5.1: recurring prompts (!schedule). One row per schedule; a
+    # background ticker (schedule_ticker) dispatches whichever are due each
+    # minute and advances next_run_ts, same as anton_mcp_approve.py's table this
+    # is a plain data row, not something requiring its own migration dance.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schedules (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id   INTEGER NOT NULL,
+            author_id    INTEGER NOT NULL,
+            project      TEXT NOT NULL,
+            prompt       TEXT NOT NULL,
+            spec         TEXT NOT NULL,
+            enabled      INTEGER NOT NULL DEFAULT 1,
+            next_run_ts  REAL NOT NULL,
+            last_run_ts  REAL,
+            created_ts   REAL NOT NULL
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -478,6 +501,179 @@ def run_by_id(channel_id: int, run_id: int) -> Optional[sqlite3.Row]:
             "WHERE id = ? AND channel_id = ?",
             (run_id, channel_id),
         ).fetchone()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Scheduled runs (Phase 5.1): !schedule add/list/pause/resume/remove. Specs are
+# normalized to a canonical machine string ("every:<seconds>",
+# "daily:HH:MM", "weekly:<0-6 Mon-Sun>:HH:MM") so compute_next_run() never has
+# to re-parse user input.
+# ---------------------------------------------------------------------------
+_WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+_WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def _parse_hhmm(s: str) -> Optional[tuple[int, int]]:
+    m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", s)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def parse_schedule_spec(text: str) -> Optional[str]:
+    """Normalize a user-supplied spec ('every 30m', 'daily 02:00',
+    'weekly mon 09:00') into a canonical string, or None if it doesn't parse."""
+    tokens = text.strip().split()
+    if not tokens:
+        return None
+    kind = tokens[0].lower()
+    if kind == "every" and len(tokens) == 2:
+        m = re.fullmatch(r"(\d+)([smhd])", tokens[1].lower())
+        if not m:
+            return None
+        n, unit = int(m.group(1)), m.group(2)
+        seconds = n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+        if seconds < 60:
+            return None  # refuse sub-minute intervals — don't hammer `claude`
+        return f"every:{seconds}"
+    if kind == "daily" and len(tokens) == 2:
+        hm = _parse_hhmm(tokens[1])
+        return f"daily:{hm[0]:02d}:{hm[1]:02d}" if hm else None
+    if kind == "weekly" and len(tokens) == 3:
+        day = tokens[1].lower()[:3]
+        hm = _parse_hhmm(tokens[2])
+        if day not in _WEEKDAYS or hm is None:
+            return None
+        return f"weekly:{_WEEKDAYS[day]}:{hm[0]:02d}:{hm[1]:02d}"
+    return None
+
+
+def split_schedule_arg(arg: str) -> Optional[tuple[str, str]]:
+    """Split '!schedule add <spec...> <prompt>' into (normalized_spec, prompt).
+    Tries the 3-token (weekly) prefix before the 2-token (every/daily) one so
+    'weekly mon 09:00 ...' doesn't get misread as a 2-token attempt first."""
+    tokens = arg.split()
+    for n in (3, 2):
+        if len(tokens) > n:
+            spec = parse_schedule_spec(" ".join(tokens[:n]))
+            if spec:
+                return spec, " ".join(tokens[n:]).strip()
+    return None
+
+
+def describe_spec(spec: str) -> str:
+    """Human-readable form of a canonical spec, for !schedule list."""
+    kind, *rest = spec.split(":")
+    if kind == "every":
+        seconds = int(rest[0])
+        if seconds % 86400 == 0:
+            return f"every {seconds // 86400}d"
+        if seconds % 3600 == 0:
+            return f"every {seconds // 3600}h"
+        return f"every {seconds // 60}m"
+    if kind == "daily":
+        return f"daily at {rest[0]}:{rest[1]}"
+    if kind == "weekly":
+        return f"weekly on {_WEEKDAY_NAMES[int(rest[0])]} at {rest[1]}:{rest[2]}"
+    return spec
+
+
+def compute_next_run(spec: str, after: float) -> float:
+    """Next run epoch strictly after `after` (local time for daily/weekly)."""
+    kind, *rest = spec.split(":")
+    if kind == "every":
+        return after + int(rest[0])
+    if kind == "daily":
+        hh, mm = int(rest[0]), int(rest[1])
+        t = time.localtime(after)
+        candidate = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, hh, mm, 0, 0, 0, -1))
+        if candidate <= after:
+            candidate += 86400
+        return candidate
+    if kind == "weekly":
+        weekday, hh, mm = int(rest[0]), int(rest[1]), int(rest[2])
+        t = time.localtime(after)
+        candidate = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, hh, mm, 0, 0, 0, -1))
+        candidate += ((weekday - t.tm_wday) % 7) * 86400
+        if candidate <= after:
+            candidate += 7 * 86400
+        return candidate
+    raise ValueError(f"unknown schedule spec: {spec}")
+
+
+def create_schedule(channel_id: int, author_id: int, project: str, prompt: str,
+                     spec: str, next_run_ts: float) -> int:
+    conn = _db()
+    try:
+        cur = conn.execute(
+            "INSERT INTO schedules (channel_id, author_id, project, prompt, spec, "
+            "enabled, next_run_ts, created_ts) VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+            (channel_id, author_id, project, prompt, spec, next_run_ts, time.time()),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def list_schedules(channel_id: int) -> list[sqlite3.Row]:
+    conn = _db()
+    try:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT id, project, prompt, spec, enabled, next_run_ts, last_run_ts "
+            "FROM schedules WHERE channel_id = ? ORDER BY id", (channel_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def due_schedules(now_ts: float) -> list[sqlite3.Row]:
+    """Every enabled schedule (any channel) due at or before `now_ts`."""
+    conn = _db()
+    try:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT id, channel_id, author_id, project, prompt, spec FROM schedules "
+            "WHERE enabled = 1 AND next_run_ts <= ?", (now_ts,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def mark_schedule_ran(schedule_id: int, next_run_ts: float, ran_ts: float) -> None:
+    conn = _db()
+    try:
+        conn.execute(
+            "UPDATE schedules SET next_run_ts = ?, last_run_ts = ? WHERE id = ?",
+            (next_run_ts, ran_ts, schedule_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_schedule_enabled(schedule_id: int, channel_id: int, enabled: bool) -> bool:
+    conn = _db()
+    try:
+        cur = conn.execute(
+            "UPDATE schedules SET enabled = ? WHERE id = ? AND channel_id = ?",
+            (int(enabled), schedule_id, channel_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def delete_schedule(schedule_id: int, channel_id: int) -> bool:
+    conn = _db()
+    try:
+        cur = conn.execute(
+            "DELETE FROM schedules WHERE id = ? AND channel_id = ?", (schedule_id, channel_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
     finally:
         conn.close()
 
@@ -1507,6 +1703,88 @@ async def _fanout_one(name: str, path: str, prompt: str, model: Optional[str],
                 pass
     return result
 
+
+# ---------------------------------------------------------------------------
+# Scheduled runs (Phase 5.1). Like fan-out, deliberately built on _fanout_one
+# rather than run_claude: this is an unattended background trigger with nobody
+# watching a live status message, so the simpler one-shot runner (fresh
+# session, no streaming activity feed, no reaction controls) is the right fit,
+# not a limitation worth building around here.
+# ---------------------------------------------------------------------------
+async def _run_scheduled(row: sqlite3.Row) -> None:
+    channel = client.get_channel(row["channel_id"])
+    if channel is None:
+        return  # channel not in cache (deleted, or bot not in it anymore) — skip silently
+    project = row["project"]
+    path = PROJECTS.get(project)
+    if path is None:
+        try:
+            await channel.send(
+                f"⏰ Scheduled run `#{row['id']}` skipped: project `{project}` "
+                "is no longer configured."
+            )
+        except discord.HTTPException:
+            pass
+        return
+    if (blocked := budget_blocked()):
+        try:
+            await channel.send(f"⏰ Scheduled run `#{row['id']}` skipped: {blocked}")
+        except discord.HTTPException:
+            pass
+        return
+
+    st = state_for(row["channel_id"], row["author_id"])
+    if st.lock.locked():
+        # Don't queue behind an active run and don't dispatch into a project
+        # something else might be mid-edit on — just wait for the next slot.
+        try:
+            await channel.send(
+                f"⏰ Scheduled run `#{row['id']}` skipped: a task is already "
+                "running in this channel."
+            )
+        except discord.HTTPException:
+            pass
+        return
+
+    try:
+        await channel.send(
+            f"⏰ **Scheduled** `#{row['id']}` · **{project}** · `{preview(row['prompt'], 100)}`"
+        )
+    except discord.HTTPException:
+        pass
+
+    async with st.lock:
+        result = await _fanout_one(project, path, row["prompt"], st.model, row["channel_id"])
+
+    icon = {"ok": "✅", "error": "⚠️", "timeout": "⏱️",
+            "crash": "❌", "not-found": "❓"}.get(result["outcome"], "•")
+    cost_bit = f" · ${result['cost']:.4f}" if result.get("cost") is not None else ""
+    body = f"{icon} Scheduled result `#{row['id']}`{cost_bit}:\n" + (result["text"] or "_(no output)_")
+    for piece in chunk(body) or [body[:MAX_MSG]]:
+        try:
+            await channel.send(piece)
+        except discord.HTTPException:
+            break
+
+
+async def schedule_ticker():
+    """Background task: once a minute, dispatch whatever schedules are due.
+    next_run_ts is advanced immediately (before the run even starts, let alone
+    finishes) so a long-running prompt can't cause the same schedule to fire
+    again on the next tick."""
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            now = time.time()
+            for row in due_schedules(now):
+                next_ts = compute_next_run(row["spec"], now)
+                mark_schedule_ran(row["id"], next_ts, now)
+                asyncio.create_task(_run_scheduled(row))
+        except Exception:  # noqa: BLE001 - a ticker hiccup must never crash the bot
+            pass
+        await asyncio.sleep(60)
+
+
 # ---------------------------------------------------------------------------
 # Discord client + command handling
 # ---------------------------------------------------------------------------
@@ -1518,6 +1796,9 @@ HELP = (
     "**Claude Code control**\n"
     f"`{PREFIX}cc <prompt>` — run Claude Code in the current project (continues the session)\n"
     f"`{PREFIX}cc-all <prompt>` — fan out to every configured project (fresh one-off runs)\n"
+    f"`{PREFIX}schedule add <spec> <prompt>` — recurring prompt; spec is `every "
+    f"<N>m|h|d`, `daily HH:MM`, or `weekly <day> HH:MM`\n"
+    f"`{PREFIX}schedule list|pause <id>|resume <id>|remove <id>` — manage schedules\n"
     f"`{PREFIX}plan <prompt>` — draft a plan first; react ✅ to execute it, 🛑 to discard\n"
     f"`{PREFIX}new` — start a fresh session\n"
     f"`{PREFIX}project [name]` — show or switch project\n"
@@ -1564,6 +1845,7 @@ def authorized(message: discord.Message) -> bool:
 
 
 _approval_watcher_started = False
+_schedule_ticker_started = False
 
 
 @client.event
@@ -1572,11 +1854,14 @@ async def on_ready():
     print(f"Allowed users: {ALLOWED_USER_IDS or 'NONE — nobody can use the bot!'}")
     print(f"Projects: {list(PROJECTS) or 'NONE — set PROJECTS'}")
     # on_ready can fire more than once (e.g. after a reconnect) — only ever start
-    # the Phase 1.3 approval-polling task once.
-    global _approval_watcher_started
+    # these background tasks once.
+    global _approval_watcher_started, _schedule_ticker_started
     if not _approval_watcher_started:
         _approval_watcher_started = True
         client.loop.create_task(approval_watcher())
+    if not _schedule_ticker_started:
+        _schedule_ticker_started = True
+        client.loop.create_task(schedule_ticker())
 
 
 @client.event
@@ -1849,6 +2134,80 @@ async def on_message(message: discord.Message):
             DEFAULT_PROJECT = next(iter(found))
         lines = "\n".join(f"• `{n}` → {p}" for n, p in found.items())
         await message.reply(f"🔎 Discovered {len(found)} project(s) under `{root}`:\n{lines}")
+
+    elif cmd == "schedule":
+        sub_parts = arg.split(maxsplit=1)
+        sub = sub_parts[0].lower() if sub_parts else ""
+        sub_arg = sub_parts[1].strip() if len(sub_parts) > 1 else ""
+
+        if sub == "add":
+            if not st.project or st.project not in PROJECTS:
+                await message.reply(f"No valid project set. Use `{PREFIX}project <name>`.")
+                return
+            parsed = split_schedule_arg(sub_arg)
+            if not parsed:
+                await message.reply(
+                    f"Usage: `{PREFIX}schedule add <every Nm|Nh|Nd | daily HH:MM | "
+                    f"weekly <day> HH:MM> <prompt>`.\nExamples: `{PREFIX}schedule add "
+                    f"every 6h check for failing tests`, `{PREFIX}schedule add daily "
+                    f"02:00 fix failing tests`, `{PREFIX}schedule add weekly mon 09:00 "
+                    f"update dependencies and open a PR`."
+                )
+                return
+            spec, prompt = parsed
+            if not prompt:
+                await message.reply("Usage needs a prompt after the schedule spec.")
+                return
+            next_ts = compute_next_run(spec, time.time())
+            sid = create_schedule(message.channel.id, message.author.id, st.project,
+                                   prompt, spec, next_ts)
+            next_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(next_ts))
+            await message.reply(
+                f"⏰ Schedule `#{sid}` added: **{describe_spec(spec)}** in **{st.project}** — "
+                f"`{preview(prompt, 100)}`\nNext run: {next_str} (local time)."
+            )
+
+        elif sub == "list":
+            rows = list_schedules(message.channel.id)
+            if not rows:
+                await message.reply(
+                    f"No schedules in this channel. Add one with `{PREFIX}schedule add ...`."
+                )
+                return
+            lines = ["**Schedules in this channel**"]
+            for r in rows:
+                mark = "▶️" if r["enabled"] else "⏸️"
+                next_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["next_run_ts"]))
+                lines.append(
+                    f"`#{r['id']}` {mark} **{describe_spec(r['spec'])}** · **{r['project']}** · "
+                    f"next {next_str} — {preview(r['prompt'], 80)}"
+                )
+            await message.reply("\n".join(lines))
+
+        elif sub in ("remove", "rm", "delete"):
+            if not sub_arg.isdigit():
+                await message.reply(f"Usage: `{PREFIX}schedule remove <id>` (see `{PREFIX}schedule list`).")
+                return
+            if delete_schedule(int(sub_arg), message.channel.id):
+                await message.reply(f"🗑️ Removed schedule `#{sub_arg}`.")
+            else:
+                await message.reply(f"No schedule `#{sub_arg}` in this channel.")
+
+        elif sub in ("pause", "resume"):
+            if not sub_arg.isdigit():
+                await message.reply(f"Usage: `{PREFIX}schedule {sub} <id>`.")
+                return
+            if set_schedule_enabled(int(sub_arg), message.channel.id, sub == "resume"):
+                word = "Resumed" if sub == "resume" else "Paused"
+                await message.reply(f"{'▶️' if sub == 'resume' else '⏸️'} {word} schedule `#{sub_arg}`.")
+            else:
+                await message.reply(f"No schedule `#{sub_arg}` in this channel.")
+
+        else:
+            await message.reply(
+                f"Usage: `{PREFIX}schedule add|list|pause|resume|remove ...`. "
+                f"See `{PREFIX}help` for spec syntax."
+            )
 
     elif cmd == "project":
         if not arg:

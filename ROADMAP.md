@@ -264,12 +264,39 @@ safety layer. All of these shell out with `cwd=PROJECTS[st.project]`.
 
 ## Phase 5 — Automation & triggers
 
-### 5.1 Scheduled runs (`!schedule`) 🟡
+### 5.1 Scheduled runs (`!schedule`) 🟡 ✅ done
 
 - **What:** Cron-style recurring prompts — nightly "fix failing tests," weekly
   "update dependencies and open a PR."
 - **How:** Store schedules in SQLite; a background `asyncio` task ticks each minute
   and dispatches due prompts through `run_claude` against a stored channel/project.
+
+> **Implementation notes (shipped):** deviates from the spec in one
+> deliberate way — dispatches through `_fanout_one()` (the Phase 6.2 one-shot
+> runner), not `run_claude`. A scheduled trigger has no originating
+> `discord.Message` to reply to (there's no user action to attach a live
+> status message, reaction controls, or a retry/cancel button to), and
+> nobody's watching it fire in real time the way they would a `!cc` they
+> just typed — so the added complexity of building a message-less variant of
+> `run_claude` wasn't worth it for an unattended background trigger. Specs
+> parse to a canonical string (`every:<seconds>`, `daily:HH:MM`,
+> `weekly:<0-6>:HH:MM`) via `parse_schedule_spec()`, so `compute_next_run()`
+> never re-parses user text; sub-minute `every` intervals are refused
+> outright to keep this from hammering `claude`. `schedule_ticker()` advances
+> `next_run_ts` *before* dispatching (not after it finishes), so a
+> long-running prompt can't get picked up again on the next tick. A
+> schedule's dispatch checks the channel's `st.lock` and skips (rather than
+> queuing) if a task's already running there — this matters more for
+> schedules than it did for fan-out, since a schedule's project is very
+> likely the same one that channel's interactive `!cc` sessions already use,
+> so a concurrent scheduled edit to the same working tree is a real risk,
+> not just a theoretical one. Verified: spec parsing and next-run math for
+> all three forms (including the daily/weekly local-time rollover cases);
+> full CRUD (create/list/due/mark-ran/enable/delete, with channel-scoping
+> enforced); and `_run_scheduled()` end-to-end against the real `claude` CLI
+> (with a stub standing in for the Discord channel, since no live gateway
+> connection was available to test against) — including the project-missing
+> and lock-already-held skip paths.
 
 ### 5.2 GitHub webhook triggers 🔴
 
