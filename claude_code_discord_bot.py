@@ -69,6 +69,7 @@ import asyncio
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
@@ -102,6 +103,11 @@ RUN_TIMEOUT = int(os.getenv("RUN_TIMEOUT", "1800"))  # seconds; hard cap per run
 STATUS_EDIT_INTERVAL = 1.3  # seconds between live status edits (Discord rate limits)
 MAX_MSG = 1900              # Discord hard limit is 2000; leave headroom
 
+# Durable state (survives restarts): channel -> project/session/model/usage.
+DB_PATH = os.getenv(
+    "ANTON_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "anton.db")
+)
+
 # Projects: env JSON wins, else edit this dict directly.
 _PROJECTS_ENV = os.getenv("PROJECTS")
 if _PROJECTS_ENV:
@@ -123,6 +129,63 @@ ALLOWED_CHANNEL_IDS = {
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 # ---------------------------------------------------------------------------
+# Durable state (SQLite) — survives bot restarts
+# ---------------------------------------------------------------------------
+def _db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS channel_state (
+            channel_id  INTEGER PRIMARY KEY,
+            project     TEXT,
+            session_id  TEXT,
+            model       TEXT,
+            runs        INTEGER NOT NULL DEFAULT 0,
+            total_cost  REAL NOT NULL DEFAULT 0.0
+        )
+        """
+    )
+    return conn
+
+
+def _load_row(channel_id: int) -> Optional[sqlite3.Row]:
+    conn = _db()
+    try:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT project, session_id, model, runs, total_cost "
+            "FROM channel_state WHERE channel_id = ?",
+            (channel_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def save_state(channel_id: int, st: "ChannelState") -> None:
+    """Persist the durable fields of a channel's state to SQLite. Called after
+    every mutation (session/project/model change, run completion) so a bot
+    restart doesn't lose in-flight conversations."""
+    conn = _db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO channel_state (channel_id, project, session_id, model, runs, total_cost)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                project    = excluded.project,
+                session_id = excluded.session_id,
+                model      = excluded.model,
+                runs       = excluded.runs,
+                total_cost = excluded.total_cost
+            """,
+            (channel_id, st.project, st.session_id, st.model, st.runs, st.total_cost),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Per-channel state
 # ---------------------------------------------------------------------------
 @dataclass
@@ -132,17 +195,28 @@ class ChannelState:
     model: Optional[str] = CLAUDE_MODEL or None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     proc: Optional[asyncio.subprocess.Process] = None  # active process, if any
-    # Usage tracking (cumulative for this channel, since the bot started)
+    # Usage tracking (cumulative for this channel, persisted across restarts)
     runs: int = 0
     total_cost: float = 0.0
-    last_rate_limit: Optional[dict] = None  # most recent rate_limit_event payload
+    last_rate_limit: Optional[dict] = None  # most recent rate_limit_event payload (not persisted)
 
 STATE: dict[int, ChannelState] = {}
 
 def state_for(channel_id: int) -> ChannelState:
     st = STATE.get(channel_id)
     if st is None:
-        st = ChannelState(project=DEFAULT_PROJECT)
+        row = _load_row(channel_id)
+        if row is not None:
+            st = ChannelState(
+                project=row["project"] or DEFAULT_PROJECT,
+                session_id=row["session_id"],
+                model=row["model"] if row["model"] is not None else (CLAUDE_MODEL or None),
+                runs=row["runs"],
+                total_cost=row["total_cost"],
+            )
+        else:
+            st = ChannelState(project=DEFAULT_PROJECT)
+            save_state(channel_id, st)
         STATE[channel_id] = st
     return st
 
@@ -230,6 +304,7 @@ async def kill(proc: Optional[asyncio.subprocess.Process]):
 # Core: run Claude Code and stream progress into a Discord message
 # ---------------------------------------------------------------------------
 async def run_claude(message: discord.Message, st: ChannelState, prompt: str):
+    channel_id = message.channel.id
     project_path = PROJECTS[st.project]
     cmd = build_command(prompt, st.session_id, st.model)
 
@@ -357,6 +432,11 @@ async def run_claude(message: discord.Message, st: ChannelState, prompt: str):
         st.proc = None
         if tick_task is not None and not tick_task.done():
             tick_task.cancel()
+        # Even on a timeout/error, `new_session` may hold a session id from
+        # the init event — keep it so the next !cc can still --resume.
+        if new_session:
+            st.session_id = new_session
+        save_state(channel_id, st)
 
 # ---------------------------------------------------------------------------
 # Discord client + command handling
@@ -423,6 +503,7 @@ async def on_message(message: discord.Message):
         else:
             st.project = arg
             st.session_id = None  # sessions are scoped to a directory
+            save_state(message.channel.id, st)
             await message.reply(f"Switched to **{arg}** (fresh session).")
 
     elif cmd == "model":
@@ -433,9 +514,11 @@ async def on_message(message: discord.Message):
             )
         elif arg.lower() in ("default", "reset", "none"):
             st.model = None
+            save_state(message.channel.id, st)
             await message.reply("Model reset to **default**.")
         else:
             st.model = arg.lower() if arg.lower() in KNOWN_MODELS else arg
+            save_state(message.channel.id, st)
             await message.reply(f"Model set to **{st.model}** for this channel.")
 
     elif cmd == "usage":
@@ -460,6 +543,7 @@ async def on_message(message: discord.Message):
 
     elif cmd == "new":
         st.session_id = None
+        save_state(message.channel.id, st)
         await message.reply(f"Started a fresh session for **{st.project or 'none'}**.")
 
     elif cmd == "status":

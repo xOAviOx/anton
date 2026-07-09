@@ -12,6 +12,10 @@ __pycache__/
 venv/
 env/
 
+# Durable bot state (session ids, project paths, cost history)
+anton.db
+*.db-journal
+
 # OS / editor
 .DS_Store
 Thumbs.db

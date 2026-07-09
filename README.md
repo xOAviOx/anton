@@ -55,6 +55,16 @@ Key options:
 | `CLAUDE_BIN` | Path to the `claude` binary if not on `PATH` |
 | `PERMISSION_MODE` | `acceptEdits` to auto-approve writes, or `default` |
 | `RUN_TIMEOUT` | Hard timeout per run, in seconds |
+| `ANTON_DB` | Path to the SQLite file used to persist per-channel state across restarts (default `anton.db` next to the script) |
+
+## Persistence
+
+Each channel's project, session id, model, and usage totals are saved to a small
+SQLite database (`anton.db` by default) after every run and every `!project` /
+`!model` / `!new`. If the bot restarts, channels pick back up their last project
+and Claude Code session — `!cc` will `--resume` where it left off instead of
+starting fresh. Delete `anton.db` (or point `ANTON_DB` elsewhere) to reset all
+channel state.
 
 ## Security
 
