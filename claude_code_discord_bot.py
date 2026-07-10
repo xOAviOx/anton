@@ -966,23 +966,20 @@ def preview(text: str, n: int = 200) -> str:
 
 def summarize_tool(name: str, inp: dict) -> str:
     """One-line, human-readable summary of a tool_use block."""
-    def short(s, n=90):
-        return preview(s, n)
-
     icons = {"Bash": "🖥️", "Read": "📖", "Edit": "✏️", "Write": "📝",
              "Glob": "🔎", "Grep": "🔎", "TodoWrite": "🗒️", "WebFetch": "🌐",
              "WebSearch": "🌐", "Task": "🤖"}
     icon = icons.get(name, "🔧")
     if name == "Bash":
-        return f"{icon} `{short(inp.get('command', ''))}`"
+        return f"{icon} `{preview(inp.get('command', ''), 90)}`"
     if name in ("Read", "Edit", "Write"):
-        return f"{icon} {name}: {short(inp.get('file_path', ''))}"
+        return f"{icon} {name}: {preview(inp.get('file_path', ''), 90)}"
     if name in ("Glob", "Grep"):
-        return f"{icon} {name}: {short(inp.get('pattern', ''))}"
+        return f"{icon} {name}: {preview(inp.get('pattern', ''), 90)}"
     if name == "TodoWrite":
         return f"{icon} updating todo list"
     if name == "Task":
-        return f"{icon} sub-agent: {short(inp.get('description', ''))}"
+        return f"{icon} sub-agent: {preview(inp.get('description', ''), 90)}"
     return f"{icon} {name}"
 
 
@@ -2160,7 +2157,10 @@ async def on_message(message: discord.Message):
     global DEFAULT_PROJECT  # mutated by !addproject/!discover when no default is set yet
 
     if cmd == "help":
-        await message.reply(HELP)
+        pieces = chunk(HELP) or [HELP[:MAX_MSG]]
+        await message.reply(pieces[0])
+        for piece in pieces[1:]:
+            await message.channel.send(piece)
 
     elif cmd == "projects":
         if not PROJECTS:
@@ -2610,10 +2610,10 @@ async def on_message(message: discord.Message):
             return
         # Show what would be discarded and ask for a ✅ before destroying work.
         _, stat, _ = await _git(project_path, "diff", "--stat", st.pre_run_ref)
-        preview = (f"```\n{stat[:1500]}\n```" if stat else "_(no tracked changes; "
-                   "untracked files will also be cleaned)_")
+        diff_preview = (f"```\n{stat[:1500]}\n```" if stat else "_(no tracked changes; "
+                        "untracked files will also be cleaned)_")
         warn = await message.reply(
-            f"⚠️ **Revert {st.project} to `{st.pre_run_ref[:8]}`?**\n{preview}\n"
+            f"⚠️ **Revert {st.project} to `{st.pre_run_ref[:8]}`?**\n{diff_preview}\n"
             "This runs `git reset --hard` + `git clean -fd` and **cannot be undone**.\n"
             "React ✅ to confirm or 🛑 to keep your changes."
         )
